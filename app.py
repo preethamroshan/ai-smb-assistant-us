@@ -42,7 +42,7 @@ with open("business_config.json", "r") as f:
 # Constants for WhatsApp
 # ----------------------------
 VERIFY_TOKEN = "make_webhook_verify"   # MUST match Meta verify token
-MAKE_WEBHOOK_URL = "https://hook.eu1.make.com/bnris781v64i4icxwfdk39m1x9lw1wqn"
+MAKE_WEBHOOK_URL = "my_make_webhook_url"
 
 # ----------------------------
 # Request model
