@@ -1,0 +1,12 @@
+{
+  "business_name": "Sri Sai Salon",
+  "type": "salon",
+  "location": "Banjara Hills, Hyderabad",
+  "timings": "10 AM to 8 PM",
+  "language_style": "English mixed with casual Indian slang",
+  "services": [
+    {"name": "Haircut", "price": 200, "duration": "30 mins"},
+    {"name": "Beard Trim", "price": 100, "duration": "15 mins"},
+    {"name": "Facial", "price": 800, "duration": "45 mins"}
+  ]
+}
