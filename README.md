@@ -91,9 +91,13 @@ Response sent back to WhatsApp
 ## 📌 Current Scope (Initial US Version)
 
 ✔ Appointment booking
+
 ✔ Booking confirmation
+
 ✔ Service & availability inquiries
+
 ✔ FSM-based conversation control
+
 ✔ Persistence & idempotency
 
 ---
