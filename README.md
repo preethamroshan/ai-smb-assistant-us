@@ -1,81 +1,138 @@
-# WhatsApp AI Receptionist (Phase 1)
+# 📞 AI WhatsApp Receptionist for US SMBs (Initial US Version)
+## Overview
 
-This is Phase 1 of an AI-powered virtual receptionist designed for small Indian businesses.
+This project is an AI-powered WhatsApp receptionist designed for US small and medium businesses (SMBs) such as salons, clinics, and local service providers.
 
-## What it does
-- Accepts customer messages (English + local slang)
-- Identifies intent (booking, service query, business info)
-- Extracts structured data (date, time, service)
-- Responds like a local staff member
-- Returns clean JSON for automation systems
+The assistant handles customer conversations, appointment booking, confirmations, and basic inquiries automatically via WhatsApp, while following a backend-controlled conversational flow for reliability and correctness.
 
-## Tech Stack
-- FastAPI (backend)
-- Groq LLM (Llama 3.1)
-- Python
-- REST API
-- Prompt-based intent extraction
+This repository represents the initial US-focused version, built on a finite state machine (FSM) architecture with database-backed persistence.
 
-## Example Input
-```json
-{
-  "text" : "Bro tomorrow evening haircut slot free aa?"
-}
-```
+## 🎯 Problem Statement
 
-## Example Output
-```json
-{
-  "intent": "booking_request",
-  "service": "Haircut",
-  "date": "tomorrow",
-  "time": "evening",
-  "reply": "Yes bro, evening slot available hai 👍 Shall I book it?"
-}
-```
+### US SMBs often face challenges such as:
+- Missed calls and messages
+- Manual appointment handling
+- Inconsistent customer responses
+- Limited staff availability
 
+### This AI receptionist solves these problems by:
+- Responding instantly on WhatsApp
+- Collecting appointment details step-by-step
+- Confirming bookings reliably
+- Reducing manual workload for business owners
 
-## Phase 2 – Booking Confirmation (Current)
+---
 
-- Multi-turn booking flow
-- Backend-managed booking state
-- Confirmation step before finalizing
-- Unique booking reference generation
-- LLM used only for intent extraction (not control)
+## ✨ Key Features (Current)
 
-This phase introduces deterministic workflows on top of LLM reasoning.
+### ✅ Conversational Appointment Booking
+- Multi-turn booking flow (service → date → time)
+- Works even when details are provided across multiple messages
 
-## Example Input
-```json
-{
-  "session_id": "user123",
-  "text": "Bro tomorrow evening haircut slot free aa?"
-}
-```
-## Example Output
-```json
-{
-  "intent": "booking_pending",
-  "reply": "Yes bro 👍 Haircut is available tomorrow evening. Shall I confirm the booking?"
-}
-```
-## Example Input
-```json
-{
-  "session_id": "user123",
-  "text": "yes"
-}
-```
-## Example Output
-```json
-{
-  "intent": "booking_confirmed",
-  "booking_id": "SALON-8392",
-  "reply": "✅ Booking confirmed bro! Ref ID: SALON-8392"
-}
-```
+### ✅ FSM-Based Conversation Control
+- Explicit conversation states:
+- IDLE
+- COLLECTING
+- CONFIRMING
+- Prevents looping, forgetting, or inconsistent behavior
 
+### ✅ Backend-Driven Intelligence
+- Backend controls booking logic
+- LLM is used only for intent & slot extraction
+- No LLM memory hacks or chat-history dependency
 
-## Status
-- Phase 2 complete.
-- Next phases will include WhatsApp integration, and voice support.
+### ✅ Persistence & Reliability
+- Session state stored in database
+- Idempotent message handling (prevents duplicate processing)
+- Booking data persisted safely
+
+### ✅ WhatsApp Cloud API Integration
+- Uses Meta WhatsApp Cloud API
+- Compatible with US phone numbers
+- Webhook-based message ingestion
+
+---
+
+## 🧠 Architecture Overview
+WhatsApp User
+     ↓
+WhatsApp Cloud API
+     ↓
+Webhook (FastAPI)
+     ↓
+FSM-based Backend Logic
+     ↓
+Database (Sessions & Bookings)
+     ↓
+Response sent back to WhatsApp
+
+---
+
+## Core Design Principles
+
+- Backend is the brain
+- LLM is a parser, not a decision-maker
+- State-driven conversation flow
+- Predictable, debuggable behavior
+
+---
+
+## 🛠 Tech Stack
+
+- Backend: FastAPI (Python)
+- LLM: Groq (LLaMA 3.1)
+- Database: SQLite (dev), designed for Postgres later
+- Messaging: WhatsApp Cloud API
+- Infra Glue: Webhooks & REST APIs
+- Version Control: Git & GitHub
+
+---
+
+## 📌 Current Scope (Initial US Version)
+
+✔ Appointment booking
+✔ Booking confirmation
+✔ Service & availability inquiries
+✔ FSM-based conversation control
+✔ Persistence & idempotency
+
+---
+
+## 🚧 Planned Features (Next Steps)
+
+This repository is an active build, not a finished product.
+Upcoming US-focused features include:
+❌ Appointment cancellation
+
+❌ Appointment rescheduling
+
+❌ Mid-booking service modification
+
+❌ Date & time normalization (US formats, AM/PM)
+
+❌ Business hours & availability rules
+
+❌ Admin dashboard (replace static config)
+
+❌ Multi-language support (US-first, extensible later)
+
+❌ Session timeouts & cleanup
+
+❌ Human handoff option
+
+---
+
+## 🚀 Status
+
+- Stage: Initial US Version (FSM & Persistence Complete)
+- Next Milestone: US Intent Schema + Cancellation & Rescheduling FSM
+
+---
+
+## 📖 Notes
+
+- This project intentionally avoids LangChain-style memory.
+- Conversation correctness is achieved via explicit state management.
+- The codebase is designed to scale to voice assistants and other channels later.
+
+---
