@@ -1,12 +1,16 @@
 {
-  "business_name": "Sri Sai Salon",
+  "name": "No Name Salon",
   "type": "salon",
-  "location": "Banjara Hills, Hyderabad",
-  "timings": "10 AM to 8 PM",
-  "language_style": "English mixed with casual Indian slang",
-  "services": [
-    {"name": "Haircut", "price": 200, "duration": "30 mins"},
-    {"name": "Beard Trim", "price": 100, "duration": "15 mins"},
-    {"name": "Facial", "price": 800, "duration": "45 mins"}
-  ]
+  "location": "Random street, Random Colony, New Jersey",
+  "language_style": "English (US)",
+  "services": ["Haircut", "Beard Trim", "Facial"],
+
+  "business_hours": {
+    "start": "09:00",
+    "end": "19:00"
+  },
+
+  "slot_duration_minutes": 30,
+  "same_day_cutoff": "17:00",
+  "timezone": "America/New_York"
 }

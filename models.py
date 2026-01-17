@@ -8,10 +8,16 @@ class Session(Base):
     session_id = Column(String, primary_key=True, index=True)  # phone number
     last_message_id = Column(String, nullable=True)
     last_intent = Column(String, nullable=True)
-    
+    last_question = Column(String, nullable=True)
+
     pending_service = Column(String, nullable=True)
     pending_date = Column(String, nullable=True)
     pending_time = Column(String, nullable=True)
+
+    pending_booking_id = Column(String, nullable=True)
+    reschedule_target_booking_id = Column(String, nullable=True)
+    reschedule_new_date = Column(String, nullable=True)
+    reschedule_new_time = Column(String, nullable=True)
 
     processed_message_ids = Column(JSON, default=list)
 
