@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, DateTime, JSON
+from sqlalchemy import Column, String, DateTime, JSON, Boolean
 from database import Base
 from datetime import datetime, timezone
 
@@ -20,8 +20,12 @@ class Session(Base):
     reschedule_new_time = Column(String, nullable=True)
 
     processed_message_ids = Column(JSON, default=list)
+    expired_last_turn = Column(Boolean, default=False)
+    expired_from_state = Column(String, nullable=True)
 
-    updated_at = Column(DateTime, default=datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    fail_count = Column(String, default="0")   # store as string to avoid migration issues
+    handoff_offered = Column(String, default="0")
 
 class Booking(Base):
     __tablename__ = "bookings"
