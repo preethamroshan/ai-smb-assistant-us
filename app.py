@@ -20,6 +20,12 @@ import re
 from business_rules import validate_booking, parse_time
 import dateparser
 from zoneinfo import ZoneInfo
+from services.calendar_service import (
+    get_calendar_service,
+    create_calendar_event,
+    update_calendar_event,
+    delete_calendar_event,
+)
 
 def get_db():
     db = SessionLocal()
@@ -35,9 +41,14 @@ app = FastAPI()
 def on_startup():
     Base.metadata.create_all(bind=engine)
 
+GOOGLE_SERVICE_ACCOUNT_PATH = os.getenv("GOOGLE_SERVICE_ACCOUNT_PATH")
+GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID")
+
 # Initialize Groq client
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-
+calendar_service = None
+if GOOGLE_SERVICE_ACCOUNT_PATH and GOOGLE_CALENDAR_ID:
+    calendar_service = get_calendar_service(GOOGLE_SERVICE_ACCOUNT_PATH)
 # Load business config
 with open("business_config.json", "r") as f:
     business_info = json.load(f)
@@ -46,6 +57,20 @@ COLLECTING_TIMEOUT_MINUTES = 30
 CONFIRMING_TIMEOUT_MINUTES = 10
 RESCHEDULE_TIMEOUT_MINUTES = 30
 CANCEL_TIMEOUT_MINUTES = 10
+
+# ----------------------------
+# Constants for Calendar
+# ----------------------------
+BUSINESS_TIMEZONE = os.getenv("BUSINESS_TIMEZONE", business_info["timezone"])
+def booking_to_event_times(date_str: str, time_hhmm: str, duration_minutes: int, timezone_name: str):
+    # date_str: "2026-01-23"
+    # time_hhmm: "18:30"
+    tz = ZoneInfo(timezone_name)
+
+    dt_start = datetime.fromisoformat(f"{date_str} {time_hhmm}:00").replace(tzinfo=tz)
+    dt_end = dt_start + timedelta(minutes=duration_minutes)
+
+    return dt_start.isoformat(), dt_end.isoformat()
 
 # ----------------------------
 # Constants for WhatsApp
@@ -909,6 +934,16 @@ def chat(msg: Message, db: Session = Depends(get_db)):
             if booking_to_cancel:
                 booking_to_cancel.status = "CANCELLED"
 
+            if calendar_service and GOOGLE_CALENDAR_ID and booking_to_cancel.calendar_event_id:
+                try:
+                    delete_calendar_event(
+                        service=calendar_service,
+                        calendar_id=GOOGLE_CALENDAR_ID,
+                        event_id=booking_to_cancel.calendar_event_id
+                    )
+                except Exception as e:
+                    print("Calendar delete failed:", str(e))
+
             session.booking_state = "IDLE"
             session.pending_booking_id = None
             session.updated_at = now
@@ -999,6 +1034,32 @@ def chat(msg: Message, db: Session = Depends(get_db)):
             if intent == "booking_confirm" or user_text.lower() in {"yes", "confirm", "ok", "sure"}:
                 pending_booking.status = "CONFIRMED"
                 pending_booking.confirmed_at = now
+
+                # -----------------------------
+                # GOOGLE CALENDAR CREATE EVENT
+                # -----------------------------
+                if calendar_service and GOOGLE_CALENDAR_ID:
+                    try:
+                        start_iso, end_iso = booking_to_event_times(
+                            date_str=pending_booking.date,
+                            time_hhmm=pending_booking.time,
+                            duration_minutes=business_info["slot_duration_minutes"],
+                            timezone_name=business_info["timezone"]
+                        )
+
+                        event_title = f"{business_info['name']} - {pending_booking.service}"
+                        event_id = create_calendar_event(
+                            service=calendar_service,
+                            calendar_id=GOOGLE_CALENDAR_ID,
+                            title=event_title,
+                            start_iso=start_iso,
+                            end_iso=end_iso,
+                            timezone=business_info["timezone"]
+                        )
+
+                        pending_booking.calendar_event_id = event_id
+                    except Exception as e:
+                        print("Calendar create failed:", str(e))
 
                 session.booking_state = "IDLE"
                 session.pending_service = None
@@ -1267,6 +1328,29 @@ def chat(msg: Message, db: Session = Depends(get_db)):
 
             booking_to_update.date = session.reschedule_new_date
             booking_to_update.time = session.reschedule_new_time
+            
+            if calendar_service and GOOGLE_CALENDAR_ID and booking_to_update.calendar_event_id:
+                try:
+                    start_iso, end_iso = booking_to_event_times(
+                        date_str=booking_to_update.date,
+                        time_hhmm=booking_to_update.time,
+                        duration_minutes=business_info["slot_duration_minutes"],
+                        timezone_name=business_info["timezone"]
+                    )
+
+                    event_title = f"{business_info['name']} - {booking_to_update.service}"
+
+                    update_calendar_event(
+                        service=calendar_service,
+                        calendar_id=GOOGLE_CALENDAR_ID,
+                        event_id=booking_to_update.calendar_event_id,
+                        title=event_title,
+                        start_iso=start_iso,
+                        end_iso=end_iso,
+                        timezone=business_info["timezone"]
+                    )
+                except Exception as e:
+                    print("Calendar update failed:", str(e))
 
             session.booking_state = "IDLE"
             session.reschedule_target_booking_id = None

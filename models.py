@@ -38,3 +38,6 @@ class Booking(Base):
     status = Column(String)  # PENDING | CONFIRMED | CANCELLED
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     confirmed_at = Column(DateTime, nullable=True)
+    calendar_event_id = Column(String, nullable=True)
+    calendar_provider = Column(String, default="google")
+    calendar_last_synced_at = Column(DateTime(timezone=True), nullable=True)
