@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, Depends
+from fastapi import FastAPI, Request, Depends, HTTPException, Header
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 import json
@@ -12,8 +12,7 @@ from prompts import build_system_prompt
 from database import engine
 from models import Base
 from database import SessionLocal
-from models import Booking
-from models import Session
+from models import Booking, Session, StripeWebhookEvent
 from sqlalchemy.exc import IntegrityError
 from random import choice
 import re
@@ -26,6 +25,18 @@ from services.calendar_service import (
     update_calendar_event,
     delete_calendar_event,
 )
+import stripe
+
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
+
+STRIPE_SUCCESS_URL = os.getenv("STRIPE_SUCCESS_URL")
+STRIPE_CANCEL_URL = os.getenv("STRIPE_CANCEL_URL")
+
+if STRIPE_SECRET_KEY:
+    stripe.api_key = STRIPE_SECRET_KEY
+if not STRIPE_SECRET_KEY:
+    print("⚠️ STRIPE_SECRET_KEY not set — payments disabled")
 
 def get_db():
     db = SessionLocal()
@@ -57,6 +68,7 @@ COLLECTING_TIMEOUT_MINUTES = 30
 CONFIRMING_TIMEOUT_MINUTES = 10
 RESCHEDULE_TIMEOUT_MINUTES = 30
 CANCEL_TIMEOUT_MINUTES = 10
+PAYMENT_TIMEOUT_MINUTES = 15
 
 # ----------------------------
 # Constants for Calendar
@@ -101,6 +113,29 @@ SERVICE_QUESTIONS = [
     "Which service would you like to book?",
     "What service are you looking for?"
 ]
+
+DEPOSIT_RULES_BY_SERVICE = {
+    "facial": {
+        "deposit_required": True,
+        "deposit_amount_cents": 2000,
+    },
+    "haircut": {
+        "deposit_required": False,
+        "deposit_amount_cents": 0,
+    },
+    "beard trim": {
+        "deposit_required": False,
+        "deposit_amount_cents": 0,
+    },
+}
+
+PRIME_TIME_RULES = {
+    "enabled": True,
+    "weekend_required": True,
+    "evening_required": True,
+    "evening_start_hour": 18,  # 6 PM
+    "deposit_amount_cents": 1500,
+}
 
 def is_session_expired(session: Session, now: datetime) -> bool:
     if not session.updated_at:
@@ -759,6 +794,89 @@ def handle_expired_session_ux(session, intent, user_text, db):
     return None
 
 # =========================================================
+# PAYMENT HELPERS
+# =========================================================
+def compute_deposit(service: str, date: str, time: str) -> int:
+    """
+    Returns deposit amount in cents.
+    """
+    service_key = service.lower().strip()
+    service_rule = DEPOSIT_RULES_BY_SERVICE.get(service_key, {
+        "deposit_required": False,
+        "deposit_amount_cents": 0
+    })
+
+    service_deposit = service_rule["deposit_amount_cents"]
+
+    # ---- Prime time logic ----
+    prime_deposit = 0
+    if PRIME_TIME_RULES.get("enabled"):
+        booking_dt = datetime.fromisoformat(f"{date} {time}")
+        weekday = booking_dt.weekday()  # 5=Sat, 6=Sun
+
+        is_weekend = weekday >= 5
+        is_evening = booking_dt.hour >= PRIME_TIME_RULES["evening_start_hour"]
+
+        if (
+            (PRIME_TIME_RULES["weekend_required"] and is_weekend)
+            or (PRIME_TIME_RULES["evening_required"] and is_evening)
+        ):
+            prime_deposit = PRIME_TIME_RULES["deposit_amount_cents"]
+
+    return max(service_deposit, prime_deposit)
+
+def refund_booking(booking: Booking):
+    """
+    Minimal, safe refund logic.
+    Call ONLY for system-triggered refunds.
+    """
+    if not booking.stripe_payment_intent_id:
+        return
+
+    try:
+        stripe.Refund.create(
+            payment_intent=booking.stripe_payment_intent_id
+        )
+        booking.payment_status = "REFUNDED"
+    except Exception as e:
+        booking.payment_last_error = str(e)
+
+def expire_payment_if_needed(booking: Booking, db, now: datetime) -> bool:
+    """
+    Expires a pending payment if timeout passed.
+    Returns True if booking was expired.
+    """
+
+    # Only care about unpaid, payment-required bookings
+    if booking.status != "PENDING":
+        return False
+
+    if booking.payment_status not in {
+        "REQUIRES_PAYMENT",
+        "CHECKOUT_CREATED"
+    }:
+        return False
+
+    if not booking.payment_expires_at:
+        return False
+
+    if booking.payment_expires_at > now:
+        return False
+
+    # -----------------------------
+    # EXPIRE BOOKING
+    # -----------------------------
+    booking.payment_status = "EXPIRED"
+    booking.status = "CANCELLED"
+
+    # Refund if money somehow got captured
+    if booking.stripe_payment_intent_id:
+        refund_booking(booking)
+
+    db.commit()
+    return True
+
+# =========================================================
 # CHAT ENDPOINT (UNCHANGED LOGIC)
 # =========================================================
 @app.post("/chat")
@@ -984,6 +1102,19 @@ def chat(msg: Message, db: Session = Depends(get_db)):
         )
         .first()
     )
+    if pending_booking:
+        if expire_payment_if_needed(pending_booking, db, now):
+            session.booking_state = "IDLE"
+            session.updated_at = now
+            db.commit()
+
+            return {
+                "intent": "payment_expired",
+                "reply": (
+                    "⏳ Your payment window expired, so the booking was released.\n"
+                    "Would you like to try booking again?"
+                )
+            }
 
     if session.booking_state == "CONFIRMING" and pending_booking:
         # ---------------------------------------------
@@ -1032,12 +1163,44 @@ def chat(msg: Message, db: Session = Depends(get_db)):
             # CONFIRM YES
             # ---------------------------------------------
             if intent == "booking_confirm" or user_text.lower() in {"yes", "confirm", "ok", "sure"}:
+
+                deposit_amount = compute_deposit(
+                    pending_booking.service,
+                    pending_booking.date,
+                    pending_booking.time
+                )
+
+                # --------------------------------------------------
+                # CASE 1: DEPOSIT REQUIRED → DO NOT CONFIRM
+                # --------------------------------------------------
+                if deposit_amount > 0:
+
+                    pending_booking.payment_required = True
+                    pending_booking.payment_status = "REQUIRES_PAYMENT"
+                    pending_booking.deposit_amount_cents = deposit_amount
+                    pending_booking.currency = "usd"
+
+                    session.booking_state = "PAYMENT_PENDING"
+                    session.updated_at = now
+                    db.commit()
+
+                    return {
+                        "intent": "payment_required",
+                        "reply": (
+                            f"To confirm your {pending_booking.service} appointment on "
+                            f"{pending_booking.date} at {format_time_for_user(pending_booking.time)}, "
+                            "a small deposit is required.\n\n"
+                            "I’ll send you a secure payment link next."
+                        )
+                    }
+
+                # --------------------------------------------------
+                # CASE 2: NO DEPOSIT → CONFIRM IMMEDIATELY (OLD LOGIC)
+                # --------------------------------------------------
                 pending_booking.status = "CONFIRMED"
                 pending_booking.confirmed_at = now
 
-                # -----------------------------
-                # GOOGLE CALENDAR CREATE EVENT
-                # -----------------------------
+                # Google Calendar create (UNCHANGED)
                 if calendar_service and GOOGLE_CALENDAR_ID:
                     try:
                         start_iso, end_iso = booking_to_event_times(
@@ -1075,9 +1238,11 @@ def chat(msg: Message, db: Session = Depends(get_db)):
                     "reply": (
                         f"✅ Your appointment is confirmed!\n"
                         f"Ref ID: {pending_booking.id}\n"
-                        f"See you on {pending_booking.date} at {format_time_for_user(pending_booking.time)}."
+                        f"See you on {pending_booking.date} at "
+                        f"{format_time_for_user(pending_booking.time)}."
                     )
                 }
+
 
             # ---------------------------------------------
             # CONFIRM NO
@@ -1637,6 +1802,228 @@ def chat(msg: Message, db: Session = Depends(get_db)):
     "intent": intent or "fallback",
     "reply": data.get("reply") or f"Welcome to {business_info['name']}! How can I help you today?"
 }
+
+# =========================================================
+# PAYMENTS — STRIPE CHECKOUT
+# =========================================================
+@app.post("/payments/create-checkout-session")
+def create_checkout_session(booking_id: str, db: Session = Depends(get_db)):
+
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="Stripe not configured")
+
+    booking = db.query(Booking).filter(Booking.id == booking_id).first()
+    if not booking:
+        raise HTTPException(status_code=404, detail="Booking not found")
+    
+    now = datetime.now(timezone.utc)
+    # Auto-expire old payment attempts
+    if expire_payment_if_needed(booking, db, now):
+        raise HTTPException(
+            status_code=400,
+            detail="Payment session expired. Please start booking again."
+        )
+    
+    # Idempotency: already paid
+    if booking.payment_status == "PAID":
+        return {
+            "status": "already_paid",
+            "message": "Payment already completed"
+        }
+    
+    # ----------------------------------------
+    # VALIDATE BOOKING IS PAYABLE
+    # ----------------------------------------
+    if booking.status != "PENDING":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Booking not payable (status={booking.status})"
+        )
+
+    if booking.payment_status not in {
+        None,
+        "REQUIRES_PAYMENT",
+        "CHECKOUT_CREATED"
+    }:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid payment state ({booking.payment_status})"
+        )
+
+    # Optional (but recommended): prevent expired payments
+    if booking.payment_expires_at and booking.payment_expires_at < datetime.now(timezone.utc):
+        raise HTTPException(
+            status_code=400,
+            detail="Payment session expired"
+        )
+
+    deposit_amount = compute_deposit(
+        booking.service,
+        booking.date,
+        booking.time
+    )
+
+    # No payment required
+    if deposit_amount <= 0:
+        booking.payment_required = False
+        booking.payment_status = "NOT_REQUIRED"
+        booking.status = "CONFIRMED"
+        booking.confirmed_at = datetime.now(timezone.utc)
+        db.commit()
+        return {"status": "confirmed_without_payment"}
+
+    try:
+        checkout = stripe.checkout.Session.create(
+            mode="payment",
+            payment_method_types=["card"],
+            line_items=[{
+                "price_data": {
+                    "currency": "usd",
+                    "product_data": {
+                        "name": f"{booking.service} deposit",
+                    },
+                    "unit_amount": deposit_amount,
+                },
+                "quantity": 1,
+            }],
+            metadata={
+                "booking_id": booking.id,
+                "phone_number": booking.phone_number,
+            },
+            success_url=STRIPE_SUCCESS_URL,
+            cancel_url=STRIPE_CANCEL_URL,
+        )
+    except Exception as e:
+        booking.payment_last_error = str(e)
+        db.commit()
+        raise HTTPException(status_code=500, detail="Stripe checkout creation failed")
+
+    booking.payment_required = True
+    booking.payment_status = "CHECKOUT_CREATED"
+    booking.deposit_amount_cents = deposit_amount
+    booking.currency = "usd"
+
+    booking.stripe_checkout_session_id = checkout.id
+    booking.payment_link = checkout.url
+    booking.payment_expires_at = datetime.now(timezone.utc) + timedelta(minutes=PAYMENT_TIMEOUT_MINUTES)
+    booking.payment_attempt_count = (booking.payment_attempt_count or 0) + 1
+
+    db.commit()
+
+    return {
+        "checkout_url": checkout.url,
+        "expires_at": booking.payment_expires_at.isoformat()
+    }
+
+# =========================================================
+# PAYMENTS — STRIPE WEBHOOK ENDPOINT
+# =========================================================
+@app.post("/stripe/webhook")
+async def stripe_webhook(
+    request: Request,
+    stripe_signature: str = Header(None, alias="Stripe-Signature"),
+    db: Session = Depends(get_db)
+):
+    payload = await request.body()
+
+    try:
+        event = stripe.Webhook.construct_event(
+            payload=payload,
+            sig_header=stripe_signature,
+            secret=STRIPE_WEBHOOK_SECRET,
+        )
+    except Exception as e:
+        print("❌ Stripe webhook verification failed:", str(e))
+        return {"status": "invalid_signature"}
+
+    # Deduplicate webhook events
+    if db.query(StripeWebhookEvent).filter(
+        StripeWebhookEvent.event_id == event.id
+    ).first():
+        return {"status": "duplicate_event"}
+
+    db.add(StripeWebhookEvent(
+        event_id=event.id,
+        event_type=event.type,
+        payload=event.data.object
+    ))
+    db.commit()
+
+    # ----------------------------------------
+    # PAYMENT SUCCESS
+    # ----------------------------------------
+    if event.type == "checkout.session.completed":
+        session = event.data.object
+        booking_id = session.metadata.get("booking_id")
+
+        booking = db.query(Booking).filter(Booking.id == booking_id).first()
+        if not booking:
+            return {"status": "booking_not_found"}
+
+        # Prevent double processing
+        if booking.payment_status == "PAID":
+            return {"status": "duplicate_event_ignored"}
+
+        # Ignore late webhook for expired/cancelled booking
+        if booking.status != "PENDING":
+            booking.payment_status = "LATE_PAYMENT"
+            db.commit()
+            return {"status": "late_payment_ignored"}
+
+        booking.payment_status = "PAID"
+        booking.status = "CONFIRMED"
+        booking.confirmed_at = datetime.now(timezone.utc)
+        booking.paid_at = datetime.now(timezone.utc)
+        booking.stripe_payment_intent_id = session.payment_intent
+
+        # Create calendar event ONLY HERE
+        if calendar_service and GOOGLE_CALENDAR_ID:
+            try:
+                start_iso, end_iso = booking_to_event_times(
+                    booking.date,
+                    booking.time,
+                    business_info["slot_duration_minutes"],
+                    business_info["timezone"]
+                )
+
+                event_title = f"{business_info['name']} - {booking.service}"
+
+                event_id = create_calendar_event(
+                    service=calendar_service,
+                    calendar_id=GOOGLE_CALENDAR_ID,
+                    title=event_title,
+                    start_iso=start_iso,
+                    end_iso=end_iso,
+                    timezone=business_info["timezone"]
+                )
+
+                booking.calendar_event_id = event_id
+            except Exception as e:
+                print("Calendar create failed after payment:", str(e))
+
+        db.commit()
+
+    return {"status": "ok"}
+
+# =========================================================
+# PAYMENTS — STATUS ENDPOINT
+# =========================================================
+@app.get("/payments/status/{booking_id}")
+def payment_status(booking_id: str, db: Session = Depends(get_db)):
+    booking = db.query(Booking).filter(Booking.id == booking_id).first()
+    if not booking:
+        raise HTTPException(status_code=404, detail="Booking not found")
+    now = datetime.now(timezone.utc)
+    expire_payment_if_needed(booking, db, now)
+    return {
+        "booking_id": booking.id,
+        "booking_status": booking.status,
+        "payment_status": booking.payment_status,
+        "payment_required": booking.payment_required,
+        "amount_cents": booking.deposit_amount_cents,
+        "payment_link": booking.payment_link,
+        "paid_at": booking.paid_at,
+    }
 
 # =========================================================
 # WHATSAPP WEBHOOK — VERIFICATION (GET)
