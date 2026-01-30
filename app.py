@@ -16,6 +16,15 @@ from models import Booking, Session, StripeWebhookEvent
 from sqlalchemy.exc import IntegrityError
 from random import choice
 import re
+from utils.date_utils import parse_date_us, extract_date_phrase, user_mentioned_date
+from utils.time_utils import (
+    normalize_time,
+    infer_time_from_text,
+    user_mentioned_time,
+    format_time_for_user,
+)
+from services.deposit_service import compute_deposit
+from utils.extraction_utils import safe_extract_date, safe_extract_time
 from business_rules import validate_booking, parse_time
 import dateparser
 from zoneinfo import ZoneInfo
@@ -25,6 +34,20 @@ from services.calendar_service import (
     update_calendar_event,
     delete_calendar_event,
 )
+from services.booking_service import (
+    is_slot_taken,
+    suggest_slots_around,
+    extract_booking_ref_id,
+    booking_to_event_times,
+)
+from services.faq_service import (
+    handle_faq_reply,
+    infer_faq_intent_from_text,
+)
+from fsm.reschedule import handle_reschedule_state
+from fsm.cancel import handle_cancel_confirm_state
+from fsm.confirming import handle_confirming_state
+from fsm.collecting import handle_collecting_state
 import stripe
 
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
@@ -74,15 +97,6 @@ PAYMENT_TIMEOUT_MINUTES = 15
 # Constants for Calendar
 # ----------------------------
 BUSINESS_TIMEZONE = os.getenv("BUSINESS_TIMEZONE", business_info["timezone"])
-def booking_to_event_times(date_str: str, time_hhmm: str, duration_minutes: int, timezone_name: str):
-    # date_str: "2026-01-23"
-    # time_hhmm: "18:30"
-    tz = ZoneInfo(timezone_name)
-
-    dt_start = datetime.fromisoformat(f"{date_str} {time_hhmm}:00").replace(tzinfo=tz)
-    dt_end = dt_start + timedelta(minutes=duration_minutes)
-
-    return dt_start.isoformat(), dt_end.isoformat()
 
 # ----------------------------
 # Constants for WhatsApp
@@ -113,29 +127,6 @@ SERVICE_QUESTIONS = [
     "Which service would you like to book?",
     "What service are you looking for?"
 ]
-
-DEPOSIT_RULES_BY_SERVICE = {
-    "facial": {
-        "deposit_required": True,
-        "deposit_amount_cents": 2000,
-    },
-    "haircut": {
-        "deposit_required": False,
-        "deposit_amount_cents": 0,
-    },
-    "beard trim": {
-        "deposit_required": False,
-        "deposit_amount_cents": 0,
-    },
-}
-
-PRIME_TIME_RULES = {
-    "enabled": True,
-    "weekend_required": True,
-    "evening_required": True,
-    "evening_start_hour": 18,  # 6 PM
-    "deposit_amount_cents": 1500,
-}
 
 def is_session_expired(session: Session, now: datetime) -> bool:
     if not session.updated_at:
@@ -189,432 +180,8 @@ def ensure_utc_aware(dt: datetime | None) -> datetime | None:
         return dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
 
-def parse_date_us(text: str, business_info: dict) -> str | None:
-    """
-    Converts:
-      "next monday" -> YYYY-MM-DD
-      "coming tuesday" -> YYYY-MM-DD
-      "tomorrow" -> YYYY-MM-DD
-      "01/20/2026" -> YYYY-MM-DD
-    """
-    if not text:
-        return None
-
-    tz_name = business_info.get("timezone", "America/New_York")
-    tz = ZoneInfo(tz_name)
-
-    cleaned = text.strip().lower()
-
-    # -------------------------------
-    # ✅ Manual handling for weekdays
-    # -------------------------------
-    weekdays = {
-        "monday": 0,
-        "tuesday": 1,
-        "wednesday": 2,
-        "thursday": 3,
-        "friday": 4,
-        "saturday": 5,
-        "sunday": 6,
-    }
-
-    base_date = datetime.now(tz).date()
-
-    # detect phrases like: "next monday", "coming tuesday", "this friday"
-    m = re.search(r"\b(next|coming|this)\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", cleaned)
-    if m:
-        which = m.group(1)
-        day_name = m.group(2)
-
-        target_weekday = weekdays[day_name]
-        today_weekday = base_date.weekday()
-
-        days_ahead = (target_weekday - today_weekday) % 7
-
-        # If today is same weekday and user says "this monday" -> today
-        if which == "this":
-            if days_ahead == 0:
-                return base_date.isoformat()
-            return (base_date + timedelta(days=days_ahead)).isoformat()
-
-        # If user says "next monday":
-        # If today is Monday, next Monday should be +7 days, not today.
-        if which in {"next", "coming"}:
-            if days_ahead == 0:
-                days_ahead = 7
-            return (base_date + timedelta(days=days_ahead)).isoformat()
-
-    # -------------------------------
-    # fallback: dateparser for everything else
-    # -------------------------------
-    dt = dateparser.parse(
-        cleaned,
-        settings={
-            "PREFER_DATES_FROM": "future",
-            "RELATIVE_BASE": datetime.now(tz),
-            "DATE_ORDER": "MDY",
-            "RETURN_AS_TIMEZONE_AWARE": False,
-            "STRICT_PARSING": False,
-        }
-    )
-
-    if not dt:
-        return None
-
-    return dt.date().isoformat()
-
-def infer_time_from_text(text: str) -> str | None:
-    """
-    Extract time only if user actually mentioned a time/bucket.
-    Prevents false positives and looping.
-    """
-    if not text:
-        return None
-
-    t = text.lower()
-
-    # Buckets
-    if "morning" in t:
-        return "10:00"
-    if "afternoon" in t:
-        return "14:00"
-    if "evening" in t:
-        return "18:00"
-    if "night" in t:
-        return "19:30"
-
-    # If user contains am/pm or HH:MM or a plain hour
-    if re.search(r"\b(\d{1,2})(:\d{2})?\s*(am|pm)\b", t):
-        return normalize_time(text)
-
-    if re.search(r"\b([01]?\d|2[0-3]):[0-5]\d\b", t):
-        return normalize_time(text)
-
-    if re.search(r"\b\d{1,2}\b", t):
-        # This allows "at 6" or "6" to work
-        return normalize_time(text)
-
-    return None
-
-def normalize_time(text: str) -> str | None:
-    """
-    Returns normalized time as HH:MM (24-hour format)
-    Examples:
-      "6 pm" -> "18:00"
-      "6:30pm" -> "18:30"
-      "15:30" -> "15:30"
-      "evening" -> "18:00"
-      "6" -> "06:00"
-    """
-    if not text:
-        return None
-
-    t = text.strip().lower()
-
-    # Buckets
-    if "morning" in t:
-        return "10:00"
-    if "afternoon" in t:
-        return "14:00"
-    if "evening" in t:
-        return "18:00"
-    if "night" in t:
-        return "19:30"
-
-    # Remove spaces: "6 pm" -> "6pm"
-    t = t.replace(" ", "")
-
-    # 12-hour formats: 6pm / 6:30pm / 12am / 12:15am
-    match_12h = re.match(r"^(\d{1,2})(?::(\d{2}))?(am|pm)$", t)
-    if match_12h:
-        hour = int(match_12h.group(1))
-        minute = int(match_12h.group(2)) if match_12h.group(2) else 0
-        ampm = match_12h.group(3)
-
-        if hour == 12:
-            hour = 0
-        if ampm == "pm":
-            hour += 12
-
-        return f"{hour:02d}:{minute:02d}"
-
-    # 24-hour HH:MM
-    match_24h = re.match(r"^([01]?\d|2[0-3]):([0-5]\d)$", t)
-    if match_24h:
-        hour = int(match_24h.group(1))
-        minute = int(match_24h.group(2))
-        return f"{hour:02d}:{minute:02d}"
-
-    # Hour only (e.g. "6")
-    match_hour_only = re.match(r"^(\d{1,2})$", t)
-    if match_hour_only:
-        hour = int(match_hour_only.group(1))
-        if 0 <= hour <= 23:
-            return f"{hour:02d}:00"
-
-    return None
-
-
-def format_time_for_user(hhmm: str) -> str:
-    """
-    Converts "18:00" -> "6:00 PM"
-    Assumes input is always HH:MM
-    """
-    try:
-        hour, minute = map(int, hhmm.split(":"))
-    except Exception:
-        return hhmm  # fallback
-
-    suffix = "AM"
-    if hour >= 12:
-        suffix = "PM"
-
-    display_hour = hour % 12
-    if display_hour == 0:
-        display_hour = 12
-
-    return f"{display_hour}:{minute:02d} {suffix}"
-
 YES_WORDS = {"yes", "y", "yeah", "yep", "sure", "confirm", "ok", "okay", "please", "do it"}
 NO_WORDS  = {"no", "n", "nope", "keep", "dont", "don't", "stop"}
-
-
-def user_mentioned_date(text: str) -> bool:
-    if not text:
-        return False
-
-    t = text.lower().strip()
-
-    weekdays = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"]
-    if any(d in t for d in weekdays):
-        return True
-
-    if any(x in t for x in ["today", "tomorrow", "day after tomorrow", "next week", "this week"]):
-        return True
-
-    # "next monday", "coming tuesday", "this friday"
-    if any(x in t for x in ["next ", "coming ", "this "]):
-        return True
-
-    # numeric date formats like 01/20/2026 or 1-20-2026
-    if re.search(r"\b\d{1,2}[/-]\d{1,2}([/-]\d{2,4})?\b", t):
-        return True
-
-    # month names
-    if re.search(r"\b(jan(uary)?|feb(ruary)?|mar(ch)?|apr(il)?|may|jun(e)?|jul(y)?|aug(ust)?|sep(t)?(ember)?|oct(ober)?|nov(ember)?|dec(ember)?)\b", t):
-        return True
-
-    return False
-
-def user_mentioned_time(text: str) -> bool:
-    """
-    Returns True only if message likely contains time info.
-    Prevents extracting random numbers like "2 services".
-    """
-    if not text:
-        return False
-
-    t = text.lower().strip()
-
-    # Buckets
-    if any(word in t for word in ["morning", "afternoon", "evening", "night"]):
-        return True
-
-    # am/pm
-    if re.search(r"\b(\d{1,2})(:\d{2})?\s*(am|pm)\b", t):
-        return True
-
-    # HH:MM 24-hour
-    if re.search(r"\b([01]?\d|2[0-3]):[0-5]\d\b", t):
-        return True
-
-    # hour only allowed ONLY if context exists: "at 6", "around 6", "by 6"
-    if re.search(r"\b(at|around|by)\s*\d{1,2}\b", t):
-        return True
-
-    # hour only allowed if message is just "6"
-    if re.fullmatch(r"\d{1,2}", t):
-        return True
-
-    return False
-
-def safe_extract_date(data: dict, user_text: str, business_info: dict) -> str | None:
-    """
-    Extract date only when:
-    - LLM provided date OR
-    - user message clearly mentions a date
-    """
-
-    # 1) Prefer LLM structured date
-    llm_date = (data or {}).get("date")
-    if llm_date:
-        parsed = parse_date_us(str(llm_date), business_info)
-        if parsed:
-            return parsed
-
-    # 2) If user mentioned a date, extract only the date phrase
-    if user_mentioned_date(user_text):
-        phrase = extract_date_phrase(user_text)   # ✅ IMPORTANT
-        parsed = parse_date_us(phrase, business_info)
-        if parsed:
-            return parsed
-
-        # 3) fallback: try full text
-        return parse_date_us(user_text, business_info)
-
-    return None
-
-def safe_extract_time(data: dict, user_text: str) -> str | None:
-    """
-    Extract time only when:
-    - LLM provided time OR
-    - user message clearly mentions a time
-    """
-    llm_time = data.get("time")
-    if llm_time:
-        return normalize_time(llm_time)
-
-    if user_mentioned_time(user_text):
-        return infer_time_from_text(user_text)
-
-    return None
-
-def extract_booking_ref_id(text: str) -> str | None:
-    """
-    Matches: SALON-XXXXXXXX
-    """
-    if not text:
-        return None
-    m = re.search(r"\bSALON-[A-Z0-9]{8}\b", text.upper())
-    return m.group(0) if m else None
-
-def is_slot_taken(db, date: str, time: str) -> bool:
-    existing = (
-        db.query(Booking)
-        .filter(
-            Booking.date == date,
-            Booking.time == time,
-            Booking.status.in_(["PENDING", "CONFIRMED"])
-        )
-        .first()
-    )
-    return existing is not None
-
-def suggest_slots_around(
-    db,
-    business_info: dict,
-    date_str: str,
-    time_hhmm: str,
-    count: int = 5
-) -> dict:
-    """
-    Suggest slots earlier + later around the requested time.
-    If business hours are over, also suggest next-day morning slots.
-
-    Returns:
-      {
-        "same_day": ["17:30", "18:00", "18:30"],
-        "next_day": ["09:00", "09:30"]
-      }
-    """
-    slot_minutes = int(business_info.get("slot_duration_minutes", 30))
-    start = business_info.get("business_hours", {}).get("start", "09:00")
-    end = business_info.get("business_hours", {}).get("end", "19:00")
-
-    start_t = parse_time(start)
-    end_t = parse_time(end)
-    base_t = parse_time(time_hhmm)
-
-    def to_minutes(tt):
-        return tt.hour * 60 + tt.minute
-
-    def to_hhmm(m):
-        h = m // 60
-        mm = m % 60
-        return f"{h:02d}:{mm:02d}"
-
-    start_min = to_minutes(start_t)
-    end_min = to_minutes(end_t)
-    base_min = to_minutes(base_t)
-
-    # clamp base within business hours for searching
-    base_min = max(start_min, min(base_min, end_min))
-
-    # gather candidates around base: base, -1, +1, -2, +2, ...
-    offsets = [0]
-    step = 1
-    while len(offsets) < 50:
-        offsets.append(-step)
-        offsets.append(step)
-        step += 1
-
-    same_day = []
-    seen = set()
-
-    for off in offsets:
-        if len(same_day) >= count:
-            break
-
-        candidate_min = base_min + (off * slot_minutes)
-
-        if candidate_min < start_min or candidate_min > end_min:
-            continue
-
-        hhmm = to_hhmm(candidate_min)
-
-        if hhmm in seen:
-            continue
-        seen.add(hhmm)
-
-        if not is_slot_taken(db, date_str, hhmm):
-            same_day.append(hhmm)
-
-    # If requested time is near/after closing OR no same-day suggestions found
-    # suggest next-day morning slots
-    next_day = []
-    if base_min >= end_min or len(same_day) == 0:
-        try:
-            next_date = (datetime.fromisoformat(date_str).date() + timedelta(days=1)).isoformat()
-        except Exception:
-            next_date = None
-
-        if next_date:
-            morning_min = start_min
-            attempts = 0
-            while len(next_day) < min(3, count) and attempts < 20:
-                hhmm = to_hhmm(morning_min)
-                if not is_slot_taken(db, next_date, hhmm):
-                    next_day.append(hhmm)
-                morning_min += slot_minutes
-                attempts += 1
-
-    return {"same_day": same_day, "next_day": next_day}
-
-def extract_date_phrase(text: str) -> str:
-    """
-    Extracts date-like phrase from user text.
-    Example:
-      "Book haircut next monday at 3 pm" -> "next monday"
-      "next tuesday at 6 pm" -> "next tuesday"
-      "tomorrow evening" -> "tomorrow"
-    """
-    t = text.lower()
-
-    patterns = [
-        r"\b(today|tomorrow|day after tomorrow)\b",
-        r"\bnext\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
-        r"\bcoming\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
-        r"\bthis\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
-        r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
-        r"\bnext week\b",
-    ]
-
-    for p in patterns:
-        m = re.search(p, t)
-        if m:
-            return m.group(0)
-
-    return text
 
 def user_wants_to_modify_booking(intent: str | None, user_text: str) -> bool:
     if intent == "booking_modify":
@@ -628,25 +195,6 @@ def user_wants_to_modify_booking(intent: str | None, user_text: str) -> bool:
             return True
 
     return False
-
-def handle_faq_reply(intent: str, business_info: dict) -> str | None:
-    if intent == "faq_hours":
-        hours = business_info.get("business_hours", {})
-        start = hours.get("start", "09:00")
-        end = hours.get("end", "19:00")
-        return f"We’re open from {format_time_for_user(start)} to {format_time_for_user(end)}."
-
-    if intent == "faq_address":
-        return f"We’re located at: {business_info.get('location', 'our salon location')} 📍"
-
-    if intent == "faq_services":
-        services = ", ".join(business_info.get("services", []))
-        return f"We offer: {services}. Which one would you like to book?"
-
-    if intent == "faq_pricing":
-        return "Pricing depends on the service 😊 Which service are you looking for? (Haircut / Facial / etc.)"
-
-    return None
 
 def booking_continue_prompt(session: Session) -> str:
     missing = []
@@ -668,23 +216,6 @@ def booking_continue_prompt(session: Session) -> str:
         return choice(TIME_QUESTIONS)
 
     return "To continue, please share the service, date, and time."
-
-def infer_faq_intent_from_text(user_text: str) -> str | None:
-    t = (user_text or "").lower()
-
-    if any(x in t for x in ["hours", "open", "close", "timing", "working hours"]):
-        return "faq_hours"
-
-    if any(x in t for x in ["address", "location", "where are you", "where r you", "located"]):
-        return "faq_address"
-
-    if any(x in t for x in ["services", "service list", "what do you offer", "do you do"]):
-        return "faq_services"
-
-    if any(x in t for x in ["price", "pricing", "cost", "how much", "charges", "$"]):
-        return "faq_pricing"
-
-    return None
 
 def get_int(session: Session, field: str, default: int = 0) -> int:
     val = getattr(session, field, None)
@@ -796,34 +327,6 @@ def handle_expired_session_ux(session, intent, user_text, db):
 # =========================================================
 # PAYMENT HELPERS
 # =========================================================
-def compute_deposit(service: str, date: str, time: str) -> int:
-    """
-    Returns deposit amount in cents.
-    """
-    service_key = service.lower().strip()
-    service_rule = DEPOSIT_RULES_BY_SERVICE.get(service_key, {
-        "deposit_required": False,
-        "deposit_amount_cents": 0
-    })
-
-    service_deposit = service_rule["deposit_amount_cents"]
-
-    # ---- Prime time logic ----
-    prime_deposit = 0
-    if PRIME_TIME_RULES.get("enabled"):
-        booking_dt = datetime.fromisoformat(f"{date} {time}")
-        weekday = booking_dt.weekday()  # 5=Sat, 6=Sun
-
-        is_weekend = weekday >= 5
-        is_evening = booking_dt.hour >= PRIME_TIME_RULES["evening_start_hour"]
-
-        if (
-            (PRIME_TIME_RULES["weekend_required"] and is_weekend)
-            or (PRIME_TIME_RULES["evening_required"] and is_evening)
-        ):
-            prime_deposit = PRIME_TIME_RULES["deposit_amount_cents"]
-
-    return max(service_deposit, prime_deposit)
 
 def refund_booking(booking: Booking):
     """
@@ -1035,61 +538,22 @@ def chat(msg: Message, db: Session = Depends(get_db)):
     # --------------------------------------------------
     # CANCEL CONFIRM STATE
     # --------------------------------------------------
-    if session.booking_state == "CANCEL_CONFIRM":
+    cancel_response = handle_cancel_confirm_state(
+        session=session,
+        session_id=session_id,
+        intent=intent,
+        user_text=user_text,
+        db=db,
+        now=now,
+        calendar_service=calendar_service,
+        GOOGLE_CALENDAR_ID=GOOGLE_CALENDAR_ID,
+        YES_WORDS=YES_WORDS,
+        NO_WORDS=NO_WORDS,
+        reset_failures=reset_failures,
+    )
 
-        if intent == "booking_confirm" or user_text.lower() in YES_WORDS:
-
-            booking_to_cancel = (
-                db.query(Booking)
-                .filter(
-                    Booking.phone_number == session_id,
-                    Booking.id == session.pending_booking_id,
-                    Booking.status == "CONFIRMED"
-                )
-                .first()
-            )
-
-            if booking_to_cancel:
-                booking_to_cancel.status = "CANCELLED"
-
-            if calendar_service and GOOGLE_CALENDAR_ID and booking_to_cancel.calendar_event_id:
-                try:
-                    delete_calendar_event(
-                        service=calendar_service,
-                        calendar_id=GOOGLE_CALENDAR_ID,
-                        event_id=booking_to_cancel.calendar_event_id
-                    )
-                except Exception as e:
-                    print("Calendar delete failed:", str(e))
-
-            session.booking_state = "IDLE"
-            session.pending_booking_id = None
-            session.updated_at = now
-            reset_failures(session)
-            db.commit()
-
-            return {
-                "intent": "booking_cancelled",
-                "reply": "Done — your appointment has been cancelled."
-            }
-
-        if intent == "booking_cancel" or user_text.lower() in NO_WORDS:
-            session.booking_state = "IDLE"
-            session.pending_booking_id = None
-            session.updated_at = now
-            reset_failures(session)
-            db.commit()
-
-            return {
-                "intent": "cancel_aborted",
-                "reply": "No worries — your appointment is still confirmed."
-            }
-
-        return {
-            "intent": "cancel_confirmation",
-            "reply": "Please reply YES to cancel or NO to keep your appointment."
-        }
-
+    if cancel_response:
+        return cancel_response
 
     # --------------------------------------------------
     # CONFIRMING STATE (PENDING BOOKINGS)
@@ -1115,159 +579,25 @@ def chat(msg: Message, db: Session = Depends(get_db)):
                     "Would you like to try booking again?"
                 )
             }
+        
+    confirming_response = handle_confirming_state(
+        session=session,
+        session_id=session_id,
+        intent=intent,
+        user_text=user_text,
+        data=data,
+        db=db,
+        now=now,
+        pending_booking=pending_booking,
+        business_info=business_info,
+        calendar_service=calendar_service,
+        GOOGLE_CALENDAR_ID=GOOGLE_CALENDAR_ID,
+        user_wants_to_modify_booking=user_wants_to_modify_booking,
+        reset_failures=reset_failures,
+    )
 
-    if session.booking_state == "CONFIRMING" and pending_booking:
-        # ---------------------------------------------
-        # MID-BOOKING CHANGE HANDLING (NEW)
-        # ---------------------------------------------
-        if intent == "booking_modify" or user_wants_to_modify_booking(intent, user_text):
-
-            # Apply safe extraction updates
-            if data.get("service"):
-                session.pending_service = data["service"]
-
-            extracted_date = safe_extract_date(data, user_text, business_info)
-            if extracted_date:
-                session.pending_date = extracted_date
-
-            extracted_time = safe_extract_time(data, user_text)
-            if extracted_time:
-                session.pending_time = extracted_time
-
-            # Cancel old pending booking record (avoid stale pending rows)
-            pending_booking.status = "CANCELLED"
-
-            # Move back to collecting so it re-validates and re-creates pending booking
-            session.booking_state = "COLLECTING"
-            session.updated_at = now
-            db.commit()
-
-            pending_booking = None  # ✅ break confirming flow so it falls through to COLLECTING
-           
-            # If user already provided all details in the same message,
-            # immediately continue booking in the same request (human-like).
-            if session.pending_service and session.pending_date and session.pending_time:
-                # Let COLLECTING block run in the same call
-                # (no return here)
-                pass
-            else:
-                return {
-                    "intent": "booking_modify",
-                    "reply": "Got it — updating your booking. 👍"
-                }
-
-        # If we changed state to COLLECTING above, skip CONFIRMING actions
-        if session.booking_state == "CONFIRMING":
-
-            # ---------------------------------------------
-            # CONFIRM YES
-            # ---------------------------------------------
-            if intent == "booking_confirm" or user_text.lower() in {"yes", "confirm", "ok", "sure"}:
-
-                deposit_amount = compute_deposit(
-                    pending_booking.service,
-                    pending_booking.date,
-                    pending_booking.time
-                )
-
-                # --------------------------------------------------
-                # CASE 1: DEPOSIT REQUIRED → DO NOT CONFIRM
-                # --------------------------------------------------
-                if deposit_amount > 0:
-
-                    pending_booking.payment_required = True
-                    pending_booking.payment_status = "REQUIRES_PAYMENT"
-                    pending_booking.deposit_amount_cents = deposit_amount
-                    pending_booking.currency = "usd"
-
-                    session.booking_state = "PAYMENT_PENDING"
-                    session.updated_at = now
-                    db.commit()
-
-                    return {
-                        "intent": "payment_required",
-                        "reply": (
-                            f"To confirm your {pending_booking.service} appointment on "
-                            f"{pending_booking.date} at {format_time_for_user(pending_booking.time)}, "
-                            "a small deposit is required.\n\n"
-                            "I’ll send you a secure payment link next."
-                        )
-                    }
-
-                # --------------------------------------------------
-                # CASE 2: NO DEPOSIT → CONFIRM IMMEDIATELY (OLD LOGIC)
-                # --------------------------------------------------
-                pending_booking.status = "CONFIRMED"
-                pending_booking.confirmed_at = now
-
-                # Google Calendar create (UNCHANGED)
-                if calendar_service and GOOGLE_CALENDAR_ID:
-                    try:
-                        start_iso, end_iso = booking_to_event_times(
-                            date_str=pending_booking.date,
-                            time_hhmm=pending_booking.time,
-                            duration_minutes=business_info["slot_duration_minutes"],
-                            timezone_name=business_info["timezone"]
-                        )
-
-                        event_title = f"{business_info['name']} - {pending_booking.service}"
-                        event_id = create_calendar_event(
-                            service=calendar_service,
-                            calendar_id=GOOGLE_CALENDAR_ID,
-                            title=event_title,
-                            start_iso=start_iso,
-                            end_iso=end_iso,
-                            timezone=business_info["timezone"]
-                        )
-
-                        pending_booking.calendar_event_id = event_id
-                    except Exception as e:
-                        print("Calendar create failed:", str(e))
-
-                session.booking_state = "IDLE"
-                session.pending_service = None
-                session.pending_date = None
-                session.pending_time = None
-                session.last_question = None
-                session.updated_at = now
-                reset_failures(session)
-                db.commit()
-
-                return {
-                    "intent": "booking_confirmed",
-                    "reply": (
-                        f"✅ Your appointment is confirmed!\n"
-                        f"Ref ID: {pending_booking.id}\n"
-                        f"See you on {pending_booking.date} at "
-                        f"{format_time_for_user(pending_booking.time)}."
-                    )
-                }
-
-
-            # ---------------------------------------------
-            # CONFIRM NO
-            # ---------------------------------------------
-            if intent == "booking_cancel" or user_text.lower() in {"no", "cancel"}:
-                pending_booking.status = "CANCELLED"
-
-                session.booking_state = "IDLE"
-                session.pending_service = None
-                session.pending_date = None
-                session.pending_time = None
-                session.last_question = None
-                session.updated_at = now
-                reset_failures(session)
-                db.commit()
-
-                return {
-                    "intent": "booking_cancelled",
-                    "reply": "No problem — the booking has been cancelled."
-                }
-
-            return {
-                "intent": "awaiting_confirmation",
-                "reply": "Please reply YES to confirm, or tell me what you’d like to change (service/date/time)."
-            }
+    if confirming_response:
+        return confirming_response
 
     # --------------------------------------------------
     # CANCEL FLOW (INITIATE CANCELLATION) - supports Ref ID
@@ -1346,8 +676,8 @@ def chat(msg: Message, db: Session = Depends(get_db)):
 
         session.booking_state = "RESCHEDULE_COLLECTING"
         session.reschedule_target_booking_id = booking_to_reschedule.id
-        session.reschedule_new_date = None
-        session.reschedule_new_time = None
+        session.reschedule_new_date = booking_to_reschedule.date
+        session.reschedule_new_time = booking_to_reschedule.time
         session.updated_at = now
         reset_failures(session)
         db.commit()
@@ -1360,196 +690,33 @@ def chat(msg: Message, db: Session = Depends(get_db)):
                 "What new date and time would you like?"
             )
         }
-
     # --------------------------------------------------
-    # RESCHEDULE COLLECTING STATE
+    # RESCHEDULE COLLECTING & CONFIRM STATE
     # --------------------------------------------------
-    if session.booking_state == "RESCHEDULE_COLLECTING":
+    reschedule_response = handle_reschedule_state(
+        session=session,
+        session_id=session_id,
+        intent=intent,
+        user_text=user_text,
+        data=data,
+        db=db,
+        now=now,
+        business_info=business_info,
+        calendar_service=calendar_service,
+        GOOGLE_CALENDAR_ID=GOOGLE_CALENDAR_ID,
+        increment_failure=increment_failure,
+        should_handoff=should_handoff,
+        offer_handoff=offer_handoff,
+        reset_session=reset_session,
+        reset_failures=reset_failures,
+        DATE_QUESTIONS=DATE_QUESTIONS,
+        TIME_QUESTIONS=TIME_QUESTIONS,
+        YES_WORDS=YES_WORDS,
+        NO_WORDS=NO_WORDS,
+    )
 
-        extracted_date = safe_extract_date(data, user_text, business_info)
-        if extracted_date:
-            session.reschedule_new_date = extracted_date
-
-        extracted_time = safe_extract_time(data, user_text)
-        if extracted_time:
-            session.reschedule_new_time = extracted_time
-
-        session.updated_at = now
-        db.commit()
-
-        if not session.reschedule_new_date:
-            return {"intent": "reschedule_in_progress", "reply": choice(DATE_QUESTIONS)}
-
-        if not session.reschedule_new_time:
-            return {"intent": "reschedule_in_progress", "reply": choice(TIME_QUESTIONS)}
-
-        # Validate business rules
-        is_valid, invalid_slot, error_msg = validate_booking(
-            session.reschedule_new_date,
-            session.reschedule_new_time,
-            business_info
-        )
-
-        if not is_valid:
-            # ❗ Treat repeated invalid inputs as failures (helps detect frustration)
-            increment_failure(session, db, now)
-
-            if should_handoff(session):
-                offer_handoff(session, db, now)
-                reset_session(session, now)
-                db.commit()
-                return {
-                    "intent": "handoff",
-                    "reply": "Sorry — I’m having trouble booking that 😅 Please call +1-XXX-XXX-XXXX 📞 and we’ll book it for you."
-                }
-
-            if invalid_slot == "time":
-                session.reschedule_new_time = None
-            if invalid_slot == "date":
-                session.reschedule_new_date = None
-
-            session.updated_at = now
-            db.commit()
-            return {"intent": "reschedule_invalid", "reply": error_msg}
-
-        # Check slot availability
-        if is_slot_taken(db, session.reschedule_new_date, session.reschedule_new_time):
-            suggestions = suggest_slots_around(
-                db=db,
-                business_info=business_info,
-                date_str=session.reschedule_new_date,
-                time_hhmm=session.reschedule_new_time,
-                count=5
-            )
-
-            session.reschedule_new_time = None
-            session.updated_at = now
-            db.commit()
-
-            same_day = suggestions.get("same_day", [])
-            next_day = suggestions.get("next_day", [])
-
-            msg_lines = ["That time is already booked."]
-
-            if same_day:
-                pretty = ", ".join([format_time_for_user(x) for x in same_day])
-                msg_lines.append(f"Here are some available times on the same day: {pretty}.")
-
-            if next_day:
-                pretty_next = ", ".join([format_time_for_user(x) for x in next_day])
-                msg_lines.append(f"If you prefer tomorrow, I can do: {pretty_next}.")
-
-            msg_lines.append("Which time works for you?")
-
-            return {
-                "intent": "reschedule_unavailable",
-                "reply": "\n".join(msg_lines)
-            }
-
-
-        session.booking_state = "RESCHEDULE_CONFIRM"
-        session.updated_at = now
-        db.commit()
-        reset_failures(session)
-
-        return {
-            "intent": "reschedule_confirm",
-            "reply": (
-                f"Got it — reschedule to {session.reschedule_new_date} at "
-                f"{format_time_for_user(session.reschedule_new_time)}?\n"
-                "Reply YES to confirm or NO to cancel."
-            )
-        }
-
-    # --------------------------------------------------
-    # RESCHEDULE CONFIRM STATE
-    # --------------------------------------------------
-    if session.booking_state == "RESCHEDULE_CONFIRM":
-
-        if intent == "booking_confirm" or user_text.lower() in YES_WORDS:
-
-            booking_to_update = (
-                db.query(Booking)
-                .filter(
-                    Booking.phone_number == session_id,
-                    Booking.id == session.reschedule_target_booking_id,
-                    Booking.status == "CONFIRMED"
-                )
-                .first()
-            )
-
-            if not booking_to_update:
-                session.booking_state = "IDLE"
-                session.reschedule_target_booking_id = None
-                session.reschedule_new_date = None
-                session.reschedule_new_time = None
-                session.updated_at = now
-                reset_failures(session)
-                db.commit()
-                return {
-                    "intent": "reschedule_failed",
-                    "reply": "I couldn’t find that appointment anymore. Please try again."
-                }
-
-            booking_to_update.date = session.reschedule_new_date
-            booking_to_update.time = session.reschedule_new_time
-            
-            if calendar_service and GOOGLE_CALENDAR_ID and booking_to_update.calendar_event_id:
-                try:
-                    start_iso, end_iso = booking_to_event_times(
-                        date_str=booking_to_update.date,
-                        time_hhmm=booking_to_update.time,
-                        duration_minutes=business_info["slot_duration_minutes"],
-                        timezone_name=business_info["timezone"]
-                    )
-
-                    event_title = f"{business_info['name']} - {booking_to_update.service}"
-
-                    update_calendar_event(
-                        service=calendar_service,
-                        calendar_id=GOOGLE_CALENDAR_ID,
-                        event_id=booking_to_update.calendar_event_id,
-                        title=event_title,
-                        start_iso=start_iso,
-                        end_iso=end_iso,
-                        timezone=business_info["timezone"]
-                    )
-                except Exception as e:
-                    print("Calendar update failed:", str(e))
-
-            session.booking_state = "IDLE"
-            session.reschedule_target_booking_id = None
-            session.reschedule_new_date = None
-            session.reschedule_new_time = None
-            session.updated_at = now
-            db.commit()
-
-            return {
-                "intent": "booking_rescheduled",
-                "reply": (
-                    f"✅ Perfect — you’re all set for {booking_to_update.date} at "
-                    f"{format_time_for_user(booking_to_update.time)}."
-                )
-            }
-
-        if intent == "booking_cancel" or user_text.lower() in NO_WORDS:
-            session.booking_state = "IDLE"
-            session.reschedule_target_booking_id = None
-            session.reschedule_new_date = None
-            session.reschedule_new_time = None
-            session.updated_at = now
-            reset_failures(session)
-            db.commit()
-
-            return {
-                "intent": "reschedule_cancelled",
-                "reply": "No problem — I didn’t make any changes."
-            }
-
-        return {
-            "intent": "reschedule_confirm",
-            "reply": "Please reply YES to confirm the reschedule or NO to cancel."
-        }
+    if reschedule_response:
+        return reschedule_response
 
     # --------------------------------------------------
     # IDLE STATE (SMART START)
@@ -1603,201 +770,28 @@ def chat(msg: Message, db: Session = Depends(get_db)):
     # --------------------------------------------------
     # COLLECTING STATE
     # --------------------------------------------------
-    if session.booking_state == "COLLECTING":
+    collecting_response = handle_collecting_state(
+        session=session,
+        session_id=session_id,
+        intent=intent,
+        user_text=user_text,
+        data=data,
+        db=db,
+        now=now,
+        business_info=business_info,
+        SERVICE_QUESTIONS=SERVICE_QUESTIONS,
+        DATE_QUESTIONS=DATE_QUESTIONS,
+        TIME_QUESTIONS=TIME_QUESTIONS,
+        increment_failure=increment_failure,
+        should_handoff=should_handoff,
+        offer_handoff=offer_handoff,
+        reset_session=reset_session,
+        reset_failures=reset_failures,
+    )
 
-        # -----------------------------
-        # SERVICE (allow override)
-        # -----------------------------
-        if data.get("service"):
-            session.pending_service = data["service"]
+    if collecting_response:
+        return collecting_response
 
-        # -----------------------------
-        # DATE (extract safely)
-        # -----------------------------
-        extracted_date = safe_extract_date(data, user_text, business_info)
-        if extracted_date:
-            session.pending_date = extracted_date
-
-        # -----------------------------
-        # TIME (extract safely + normalize)
-        # -----------------------------
-        extracted_time = safe_extract_time(data, user_text)
-        if extracted_time:
-            session.pending_time = extracted_time  # always HH:MM
-
-        session.updated_at = now
-        db.commit()
-        
-        if data.get("service") or extracted_date or extracted_time:
-            reset_failures(session)
-            db.commit()
-
-        # -----------------------------
-        # ASK ONLY FOR WHAT IS MISSING
-        # -----------------------------
-        if not session.pending_service:
-            session.last_question = "service"
-            db.commit()
-            return {"intent": "booking_in_progress", "reply": choice(SERVICE_QUESTIONS)}
-
-        if not session.pending_date:
-            session.last_question = "date"
-            db.commit()
-            return {"intent": "booking_in_progress", "reply": choice(DATE_QUESTIONS)}
-
-        if not session.pending_time:
-            session.last_question = "time"
-            db.commit()
-            return {"intent": "booking_in_progress", "reply": choice(TIME_QUESTIONS)}
-
-        # -----------------------------
-        # BUSINESS RULES VALIDATION
-        # -----------------------------
-        is_valid, invalid_slot, error_msg = validate_booking(
-            session.pending_date,
-            session.pending_time,
-            business_info
-        )
-
-        if not is_valid:
-            # ❗ Treat repeated invalid inputs as failures (helps detect frustration)
-            increment_failure(session, db, now)
-
-            if should_handoff(session):
-                offer_handoff(session, db, now)
-                reset_session(session, now)
-                db.commit()
-                return {
-                    "intent": "handoff",
-                    "reply": "Sorry — I’m having trouble booking that 😅 Please call +1-XXX-XXX-XXXX 📞 and we’ll book it for you."
-                }
-
-            if invalid_slot == "time":
-                session.pending_time = None
-            if invalid_slot == "date":
-                session.pending_date = None
-
-            session.updated_at = now
-            db.commit()
-            if invalid_slot == "time" and session.pending_date:
-                # suggest nearest valid slots on same day + tomorrow morning
-                suggestions = suggest_slots_around(
-                    db=db,
-                    business_info=business_info,
-                    date_str=session.pending_date,
-                    time_hhmm="19:00",  # fallback anchor near closing
-                    count=5
-                )
-
-                same_day = suggestions.get("same_day", [])
-                next_day = suggestions.get("next_day", [])
-
-                lines = [error_msg]
-
-                if same_day:
-                    lines.append(
-                        "Available times today: " +
-                        ", ".join([format_time_for_user(x) for x in same_day])
-                    )
-
-                if next_day:
-                    lines.append(
-                        "Or tomorrow morning: " +
-                        ", ".join([format_time_for_user(x) for x in next_day])
-                    )
-
-                lines.append("What time would you like?")
-
-                return {"intent": "booking_invalid", "reply": "\n".join(lines)}
-
-            return {"intent": "booking_invalid", "reply": error_msg}
-        
-        # Check slot availability
-        if is_slot_taken(db, session.pending_date, session.pending_time):
-            suggestions = suggest_slots_around(
-                db=db,
-                business_info=business_info,
-                date_str=session.pending_date,
-                time_hhmm=session.pending_time,
-                count=5
-            )
-
-            session.pending_time = None
-            session.updated_at = now
-            db.commit()
-
-            same_day = suggestions.get("same_day", [])
-            next_day = suggestions.get("next_day", [])
-
-            msg_lines = ["That time is already booked."]
-
-            if same_day:
-                pretty = ", ".join([format_time_for_user(x) for x in same_day])
-                msg_lines.append(f"Here are some available times on the same day: {pretty}.")
-
-            if next_day:
-                pretty_next = ", ".join([format_time_for_user(x) for x in next_day])
-                msg_lines.append(f"If you prefer tomorrow, I can do: {pretty_next}.")
-
-            msg_lines.append("Which time works for you?")
-
-            return {
-                "intent": "booking_unavailable",
-                "reply": "\n".join(msg_lines)
-            }
-
-
-        # -----------------------------
-        # CREATE PENDING BOOKING
-        # -----------------------------
-        # -----------------------------
-        # CLEANUP OLD PENDING BOOKINGS (avoid duplicates)
-        # -----------------------------
-        old_pending = (
-            db.query(Booking)
-            .filter(
-                Booking.phone_number == session_id,
-                Booking.status == "PENDING"
-            )
-            .all()
-        )
-
-        for b in old_pending:
-            b.status = "CANCELLED"
-
-        db.commit()
-
-        booking_id = f"SALON-{str(uuid.uuid4())[:8].upper()}"
-
-        booking = Booking(
-            id=booking_id,
-            phone_number=session_id,
-            service=session.pending_service,
-            date=session.pending_date,
-            time=session.pending_time,  # ALWAYS HH:MM
-            status="PENDING",
-            created_at=now
-        )
-
-        try:
-            db.add(booking)
-            db.commit()
-        except IntegrityError:
-            db.rollback()
-
-        session.booking_state = "CONFIRMING"
-        session.last_question = None
-        session.updated_at = now
-        db.commit()
-
-        return {
-            "intent": "booking_pending",
-            "reply": (
-                f"{session.pending_service} is available on "
-                f"{session.pending_date} at {format_time_for_user(session.pending_time)}.\n"
-                "Would you like me to confirm the appointment?"
-            )
-        }
     return {
     "intent": intent or "fallback",
     "reply": data.get("reply") or f"Welcome to {business_info['name']}! How can I help you today?"

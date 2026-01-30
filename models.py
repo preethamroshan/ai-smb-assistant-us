@@ -61,11 +61,8 @@ class Booking(Base):
     deposit_amount_cents = Column(Integer, default=0, nullable=False)
     currency = Column(String, default="usd", nullable=False)
 
-    # stripe_checkout_session_id = Column(String, nullable=True, index=True)
-    # stripe_payment_intent_id = Column(String, nullable=True, index=True)
-    # payment_provider = Column(String, default="razorpay")
-    # payment_order_id = Column(String, nullable=True)   # razorpay_order_id
-    # payment_payment_id = Column(String, nullable=True) # razorpay_payment_id
+    stripe_checkout_session_id = Column(String, nullable=True, index=True)
+    stripe_payment_intent_id = Column(String, nullable=True, index=True)
 
     payment_link = Column(String, nullable=True)
     payment_expires_at = Column(DateTime, nullable=True)
