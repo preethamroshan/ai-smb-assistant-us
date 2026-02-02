@@ -5,7 +5,7 @@ DATABASE_URL = "sqlite:///./app.db"
 
 engine = create_engine(
     DATABASE_URL,
-    connect_args={"check_same_thread": False},  # required for SQLite + FastAPI
+    connect_args={"check_same_thread": False, "timeout": 30},  # required for SQLite + FastAPI
     pool_pre_ping=True,
     pool_recycle=300,
 )

@@ -200,7 +200,8 @@ def handle_collecting_state(
         date=session.pending_date,
         time=session.pending_time,  # ALWAYS HH:MM
         status="PENDING",
-        created_at=now
+        created_at=now,
+        channel=session.channel
     )
 
     try:

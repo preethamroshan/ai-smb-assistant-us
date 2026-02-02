@@ -88,7 +88,7 @@ def extract_date_phrase(text: str) -> str:
     t = text.lower()
 
     patterns = [
-        r"\b(today|tomorrow|day after tomorrow)\b",
+        r"\b(day after tomorrow|tomorrow|today)\b",
         r"\bnext\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
         r"\bcoming\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
         r"\bthis\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",

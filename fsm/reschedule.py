@@ -1,5 +1,6 @@
 from utils.extraction_utils import safe_extract_date, safe_extract_time
 from utils.time_utils import format_time_for_user
+from utils.date_utils import parse_date_us
 from services.booking_service import (
     is_slot_taken,
     suggest_slots_around,
@@ -73,9 +74,17 @@ def handle_reschedule_state(
 
         # If user didn't change anything, ask clearly
         if not user_changed:
+            # If user explicitly said something like "next Thursday"
+            # but extraction failed, try parsing full text
+            fallback_date = parse_date_us(user_text, business_info)
+            if fallback_date:
+                session.reschedule_new_date = fallback_date
+                user_changed = True
+
+        if not user_changed:
             return {
                 "intent": "reschedule_in_progress",
-                "reply": "What would you like to change — date, time, or both?",
+                "reply": "What would you like to change — date, time, or both?"
             }
 
         session.updated_at = now
@@ -193,10 +202,38 @@ def handle_reschedule_state(
         extracted_time = safe_extract_time(data, user_text)
 
         if extracted_date or extracted_time:
+            # Apply patch directly
+            if extracted_date:
+                session.reschedule_new_date = extracted_date
+            if extracted_time:
+                session.reschedule_new_time = extracted_time
+
             session.booking_state = "RESCHEDULE_COLLECTING"
             session.updated_at = now
             db.commit()
-            return None  # fall back to collecting logic
+
+            # Re-run collecting logic immediately
+            return handle_reschedule_state(
+                session=session,
+                session_id=session_id,
+                intent="booking_reschedule",
+                user_text=user_text,
+                data=data,
+                db=db,
+                now=now,
+                business_info=business_info,
+                calendar_service=calendar_service,
+                GOOGLE_CALENDAR_ID=GOOGLE_CALENDAR_ID,
+                increment_failure=increment_failure,
+                should_handoff=should_handoff,
+                offer_handoff=offer_handoff,
+                reset_session=reset_session,
+                reset_failures=reset_failures,
+                DATE_QUESTIONS=DATE_QUESTIONS,
+                TIME_QUESTIONS=TIME_QUESTIONS,
+                YES_WORDS=YES_WORDS,
+                NO_WORDS=NO_WORDS,
+            )
 
         # -----------------------------
         # CONFIRM YES

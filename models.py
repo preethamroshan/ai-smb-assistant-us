@@ -6,6 +6,7 @@ class Session(Base):
     __tablename__ = "sessions"
     booking_state = Column(String, default="IDLE")
     session_id = Column(String, primary_key=True, index=True)  # phone number
+    channel = Column(String)
     last_message_id = Column(String, nullable=True)
     last_intent = Column(String, nullable=True)
     last_question = Column(String, nullable=True)
@@ -31,6 +32,7 @@ class Booking(Base):
     __tablename__ = "bookings"
 
     id = Column(String, primary_key=True)
+    channel = Column(String, default="whatsapp")
     phone_number = Column(String, index=True)
     service = Column(String)
     date = Column(String)
@@ -71,6 +73,13 @@ class Booking(Base):
     # Safety / retries
     payment_attempt_count = Column(Integer, default=0)
     payment_last_error = Column(String, nullable=True)
+
+    # Remainder fields
+    reminder_24h_sent = Column(Boolean, default=False)
+    reminder_2h_sent = Column(Boolean, default=False)
+    reminder_confirmed = Column(Boolean, default=False)
+    reminder_last_sent_at = Column(DateTime)
+    no_show_risk = Column(Boolean, default=False)
 
 class StripeWebhookEvent(Base):
     __tablename__ = "Stripe_webhook_events"
