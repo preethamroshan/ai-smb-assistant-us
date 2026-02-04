@@ -1,28 +1,19 @@
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
+import os
+from dotenv import load_dotenv
 
-DATABASE_URL = "sqlite:///./app.db"
+load_dotenv()
+
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 engine = create_engine(
     DATABASE_URL,
-    connect_args={"check_same_thread": False, "timeout": 30},  # required for SQLite + FastAPI
-    pool_pre_ping=True,
-    pool_recycle=300,
+    pool_size=5,          # safe default for small VPS
+    max_overflow=10,      # allows burst webhook traffic
+    pool_pre_ping=True,   # avoids stale connections
+    pool_recycle=300,     # refresh connections every 5 mins
 )
-
-from sqlalchemy import event
-
-@event.listens_for(engine, "connect")
-def set_sqlite_pragma(dbapi_connection, connection_record):
-    cursor = dbapi_connection.cursor()
-    try:
-        cursor.execute("PRAGMA journal_mode=WAL;")
-        cursor.execute("PRAGMA busy_timeout = 5000;")
-    except Exception as e:
-        print("[SQLITE PRAGMA WARNING]", e)
-    finally:
-        cursor.close()
-
 
 SessionLocal = sessionmaker(
     autocommit=False,

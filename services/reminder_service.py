@@ -1,132 +1,119 @@
-import os
-from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-
+from datetime import datetime, timedelta, timezone
 from database import SessionLocal
-from models import Booking
+from models import Booking, Session
 from utils.time_utils import format_time_for_user
 from services.channel_router import send_message
+import os
 
+BUSINESS_TIMEZONE = os.getenv("BUSINESS_TIMEZONE", "America/New_York")
 
-# -----------------------------
-# CONFIG
-# -----------------------------
-TEST_MODE = os.getenv("REMINDER_TEST_MODE", "false").lower() == "true"
+FIRST_WINDOW = timedelta(minutes=3)
+SECOND_WINDOW = timedelta(minutes=1)
 
-
-if TEST_MODE:
-    # In test mode we simulate time windows
-    FIRST_WINDOW = timedelta(minutes=3)
-    SECOND_WINDOW = timedelta(minutes=1)
-else:
-    FIRST_WINDOW = timedelta(hours=24)
-    SECOND_WINDOW = timedelta(hours=2)
-
-# -----------------------------
-# HELPER: Convert booking to datetime
-# -----------------------------
 def booking_to_datetime(booking):
+    local_tz = ZoneInfo(BUSINESS_TIMEZONE)
     dt_str = f"{booking.date} {booking.time}"
-    dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M")
-    return dt.replace(tzinfo=timezone.utc)
+    local_dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M")
+    local_dt = local_dt.replace(tzinfo=local_tz)
+    return local_dt.astimezone(timezone.utc)
 
 
-# -----------------------------
-# MAIN REMINDER JOB
-# -----------------------------
 def run_reminder_job():
+
     db = SessionLocal()
+    now = datetime.now(timezone.utc)
 
     try:
-        now = datetime.now(timezone.utc)
+        confirmed_bookings = (
+            db.query(Booking)
+            .filter(Booking.status == "CONFIRMED")
+            .all()
+        )
 
-        bookings = db.query(Booking).filter(
-            Booking.status == "CONFIRMED"
-        ).all()
+        for booking in confirmed_bookings:
 
-        reminders_to_send = []
-        updates_made = False
-
-        for booking in bookings:
             appointment_time = booking_to_datetime(booking)
             time_diff = appointment_time - now
 
-            # ----------------------------------
+            # ------------------------------------------------
             # 1️⃣ 24-HOUR REMINDER
-            # ----------------------------------
+            # ------------------------------------------------
             if (
-                not booking.reminder_24h_sent and
-                timedelta(0) < time_diff <= FIRST_WINDOW
+                not booking.reminder_24h_sent
+                and timedelta(0) < time_diff <= FIRST_WINDOW
             ):
-                reminders_to_send.append(
-                    ("24h", booking.id, booking.channel, booking.phone_number)
+
+                send_message(
+                    booking.channel,
+                    booking.phone_number,
+                    (
+                        f"Reminder: You have a {booking.service} appointment "
+                        f"on {booking.date} at {format_time_for_user(booking.time)}.\n"
+                        "Reply YES to confirm or CANCEL to cancel."
+                    )
                 )
 
-            # ----------------------------------
-            # 2️⃣ 2-HOUR REMINDER
-            # ----------------------------------
-            elif (
-                booking.reminder_24h_sent and
-                not booking.reminder_confirmed and
-                not booking.reminder_2h_sent and
-                timedelta(0) < time_diff <= SECOND_WINDOW
-            ):
-                reminders_to_send.append(
-                    ("2h", booking.id, booking.channel, booking.phone_number)
-                )
+                booking.reminder_24h_sent = True
+                booking.reminder_last_sent_at = now
 
-            # ----------------------------------
-            # 3️⃣ NO-SHOW RISK FLAG
-            # ----------------------------------
-            if (
-                time_diff <= timedelta(0) and
-                not booking.reminder_confirmed and
-                not booking.no_show_risk
-            ):
-                booking.no_show_risk = True
-                updates_made = True
+                bind_reminder_to_session(db, booking, now)
 
-        # Commit ONLY risk flag updates here
-        if updates_made:
-            db.commit()
-
-        db.close()  # 🔥 CLOSE BEFORE SENDING MESSAGES
-
-        # ----------------------------------------
-        # Send reminders outside DB session
-        # ----------------------------------------
-        for reminder_type, booking_id, channel, phone in reminders_to_send:
-            db2 = SessionLocal()
-            booking = db2.query(Booking).filter(Booking.id == booking_id).first()
-
-            if not booking:
-                db2.close()
+                db.commit()
                 continue
 
-            if reminder_type == "24h":
-                send_message(
-                    channel,
-                    phone,
-                    f"Reminder: You have a {booking.service} appointment "
-                    f"on {booking.date} at {format_time_for_user(booking.time)}.\n"
-                    "Reply YES to confirm or CANCEL to cancel."
-                )
-                booking.reminder_24h_sent = True
+            # ------------------------------------------------
+            # 2️⃣ 2-HOUR REMINDER
+            # ------------------------------------------------
+            if (
+                not booking.reminder_2h_sent
+                and timedelta(0) < time_diff <= SECOND_WINDOW
+            ):
 
-            elif reminder_type == "2h":
                 send_message(
-                    channel,
-                    phone,
-                    f"⏰ Reminder: Your {booking.service} appointment "
-                    f"is today at {format_time_for_user(booking.time)}.\n"
-                    "Please reply YES to confirm or CANCEL if you can’t make it."
+                    booking.channel,
+                    booking.phone_number,
+                    (
+                        f"⏰ Reminder: Your {booking.service} appointment "
+                        f"is coming up at {format_time_for_user(booking.time)}.\n"
+                        "Reply YES to confirm or CANCEL if needed."
+                    )
                 )
+
                 booking.reminder_2h_sent = True
+                booking.reminder_last_sent_at = now
 
-            booking.reminder_last_sent_at = datetime.now(timezone.utc)
+                bind_reminder_to_session(db, booking, now)
 
-            db2.commit()
-            db2.close()
+                db.commit()
+                continue
+
+            # ------------------------------------------------
+            # 3️⃣ NO-SHOW RISK TAGGING
+            # ------------------------------------------------
+            if (
+                time_diff <= timedelta(seconds=-10)  # appointment passed
+                and not booking.reminder_confirmed
+                and not booking.no_show_risk
+                and (booking.reminder_24h_sent or booking.reminder_2h_sent)
+            ):
+                booking.no_show_risk = True
+                db.commit()
 
     except Exception as e:
         print("Reminder job error:", str(e))
+
+    finally:
+        db.close()
+
+
+def bind_reminder_to_session(db, booking, now):
+    session = (
+        db.query(Session)
+        .filter(Session.session_id == booking.phone_number)
+        .first()
+    )
+
+    if session:
+        session.last_reminder_booking_id = booking.id
+        session.updated_at = now

@@ -19,12 +19,14 @@ class Session(Base):
     reschedule_target_booking_id = Column(String, nullable=True)
     reschedule_new_date = Column(String, nullable=True)
     reschedule_new_time = Column(String, nullable=True)
+    
+    last_reminder_booking_id = Column(String, nullable=True)
 
     processed_message_ids = Column(JSON, default=list)
     expired_last_turn = Column(Boolean, default=False)
     expired_from_state = Column(String, nullable=True)
 
-    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     fail_count = Column(String, default="0")   # store as string to avoid migration issues
     handoff_offered = Column(String, default="0")
 
@@ -40,8 +42,8 @@ class Booking(Base):
 
     # EXISTING
     status = Column(String)  # PENDING | CONFIRMED | CANCELLED | EXPIRED
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    confirmed_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    confirmed_at = Column(DateTime(timezone=True), nullable=True)
 
     calendar_event_id = Column(String, nullable=True)
     calendar_provider = Column(String, default="google")
@@ -67,8 +69,8 @@ class Booking(Base):
     stripe_payment_intent_id = Column(String, nullable=True, index=True)
 
     payment_link = Column(String, nullable=True)
-    payment_expires_at = Column(DateTime, nullable=True)
-    paid_at = Column(DateTime, nullable=True)
+    payment_expires_at = Column(DateTime(timezone=True), nullable=True)
+    paid_at = Column(DateTime(timezone=True), nullable=True)
 
     # Safety / retries
     payment_attempt_count = Column(Integer, default=0)
@@ -78,14 +80,14 @@ class Booking(Base):
     reminder_24h_sent = Column(Boolean, default=False)
     reminder_2h_sent = Column(Boolean, default=False)
     reminder_confirmed = Column(Boolean, default=False)
-    reminder_last_sent_at = Column(DateTime)
+    reminder_last_sent_at = Column(DateTime(timezone=True))
     no_show_risk = Column(Boolean, default=False)
 
 class StripeWebhookEvent(Base):
-    __tablename__ = "Stripe_webhook_events"
+    __tablename__ = "stripe_webhook_events"
 
     id = Column(Integer, primary_key=True)
     event_id = Column(String, unique=True, index=True, nullable=False)
     event_type = Column(String, nullable=False)
     payload = Column(JSON, nullable=False)
-    received_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    received_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))

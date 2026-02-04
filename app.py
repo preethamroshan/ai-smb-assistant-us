@@ -29,6 +29,8 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from services.reminder_service import run_reminder_job
 from channels.whatsapp import send_whatsapp_message
 
+load_dotenv()
+
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 
@@ -46,8 +48,6 @@ def get_db():
         yield db
     finally:
         db.close()
-
-load_dotenv()
 
 app = FastAPI()
 @app.on_event("startup")

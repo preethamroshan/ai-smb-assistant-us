@@ -348,30 +348,7 @@ def handle_message(
         db.refresh(session)
     
     session.channel = channel
-    db.commit
-
-    # ---------------------------------------------
-    # REMINDER CONFIRMATION HANDLING
-    # ---------------------------------------------
-    if user_text.lower() in {"yes", "confirm", "ok", "sure"}:
-        existing_booking = (
-            db.query(Booking)
-            .filter(
-                Booking.phone_number == session_id,
-                Booking.status == "CONFIRMED"
-            )
-            .order_by(Booking.created_at.desc())
-            .first()
-        )
-
-        if existing_booking and not existing_booking.reminder_confirmed:
-            existing_booking.reminder_confirmed = True
-            db.commit()
-
-            return {
-                "intent": "reminder_confirmed",
-                "reply": "Thank you! 👍 Your appointment is confirmed. See you soon!"
-            }
+    db.commit()
 
     # --------------------------------------------------
     # FSM TIMEOUT RESET
@@ -507,6 +484,74 @@ def handle_message(
                 f"Ref ID: {latest.id}"
             )
         }
+    # --------------------------------------------------
+    # REMINDER REPLY INTERCEPTOR (NON-FSM)
+    # --------------------------------------------------
+    if session.last_reminder_booking_id:
+
+        booking = (
+            db.query(Booking)
+            .filter(
+                Booking.id == session.last_reminder_booking_id,
+                Booking.phone_number == session_id,
+                Booking.status == "CONFIRMED"
+            )
+            .first()
+        )
+
+        # If booking no longer valid, clear reminder context
+        if not booking:
+            session.last_reminder_booking_id = None
+            db.commit()
+            # continue normal routing
+
+        else:
+            text_lower = user_text.lower().strip()
+
+            # -------------------------------
+            # YES → mark reminder confirmed
+            # -------------------------------
+            if intent == "booking_confirm" or text_lower in YES_WORDS:
+                booking.reminder_confirmed = True
+                session.last_reminder_booking_id = None
+                session.updated_at = now
+                reset_failures(session)
+                db.commit()
+
+                return {
+                    "intent": "reminder_confirmed",
+                    "reply": "Perfect 👍 We’ll see you then!"
+                }
+
+            # -------------------------------
+            # CANCEL → move to cancel flow
+            # -------------------------------
+            if intent == "booking_cancel" or text_lower in {"cancel"}:
+
+                # Clear reminder context
+                session.last_reminder_booking_id = None
+
+                # Move into your existing cancel FSM
+                session.booking_state = "CANCEL_CONFIRM"
+                session.pending_booking_id = booking.id
+                session.updated_at = now
+                db.commit()
+
+                return {
+                    "intent": "cancel_confirmation",
+                    "reply": (
+                        f"Just to confirm — cancel your {booking.service} appointment on "
+                        f"{booking.date} at {format_time_for_user(booking.time)}?\n"
+                        "Reply YES to cancel or NO to keep it."
+                    )
+                }
+
+            # -------------------------------
+            # Any other message → ignore reminder context
+            # Let normal FSM handle it
+            # -------------------------------
+            session.last_reminder_booking_id = None
+            db.commit()
 
     # --------------------------------------------------
     # CANCEL CONFIRM STATE
