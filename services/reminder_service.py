@@ -5,19 +5,11 @@ from models import Booking, Session
 from utils.time_utils import format_time_for_user
 from services.channel_router import send_message
 import os
-
-BUSINESS_TIMEZONE = os.getenv("BUSINESS_TIMEZONE", "America/New_York")
+from models import Business
+from utils.datetime_utils import booking_to_datetime
 
 FIRST_WINDOW = timedelta(minutes=3)
 SECOND_WINDOW = timedelta(minutes=1)
-
-def booking_to_datetime(booking):
-    local_tz = ZoneInfo(BUSINESS_TIMEZONE)
-    dt_str = f"{booking.date} {booking.time}"
-    local_dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M")
-    local_dt = local_dt.replace(tzinfo=local_tz)
-    return local_dt.astimezone(timezone.utc)
-
 
 def run_reminder_job():
 
@@ -33,11 +25,11 @@ def run_reminder_job():
 
         for booking in confirmed_bookings:
 
-            appointment_time = booking_to_datetime(booking)
+            appointment_time = booking_to_datetime(db, booking)
             time_diff = appointment_time - now
 
             # ------------------------------------------------
-            # 1️⃣ 24-HOUR REMINDER
+            # 1️⃣ FIRST REMINDER (24h in prod)
             # ------------------------------------------------
             if (
                 not booking.reminder_24h_sent
@@ -58,12 +50,11 @@ def run_reminder_job():
                 booking.reminder_last_sent_at = now
 
                 bind_reminder_to_session(db, booking, now)
-
                 db.commit()
                 continue
 
             # ------------------------------------------------
-            # 2️⃣ 2-HOUR REMINDER
+            # 2️⃣ SECOND REMINDER (2h in prod)
             # ------------------------------------------------
             if (
                 not booking.reminder_2h_sent
@@ -83,22 +74,12 @@ def run_reminder_job():
                 booking.reminder_2h_sent = True
                 booking.reminder_last_sent_at = now
 
-                bind_reminder_to_session(db, booking, now)
+                # 🔥 Reset confirmation for final attendance signal
+                booking.reminder_confirmed = False
 
+                bind_reminder_to_session(db, booking, now)
                 db.commit()
                 continue
-
-            # ------------------------------------------------
-            # 3️⃣ NO-SHOW RISK TAGGING
-            # ------------------------------------------------
-            if (
-                time_diff <= timedelta(seconds=-10)  # appointment passed
-                and not booking.reminder_confirmed
-                and not booking.no_show_risk
-                and (booking.reminder_24h_sent or booking.reminder_2h_sent)
-            ):
-                booking.no_show_risk = True
-                db.commit()
 
     except Exception as e:
         print("Reminder job error:", str(e))

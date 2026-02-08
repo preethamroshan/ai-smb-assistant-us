@@ -100,7 +100,8 @@ def handle_confirming_state(
             # --------------------------------------------------
             pending_booking.status = "CONFIRMED"
             pending_booking.confirmed_at = now
-
+            # 🔥 Default predictive risk
+            pending_booking.no_show_risk = True
             # Google Calendar create (UNCHANGED)
             if calendar_service and GOOGLE_CALENDAR_ID:
                 try:

@@ -196,6 +196,7 @@ def handle_collecting_state(
     booking = Booking(
         id=booking_id,
         phone_number=session_id,
+        business_id=session.business_id,
         service=session.pending_service,
         date=session.pending_date,
         time=session.pending_time,  # ALWAYS HH:MM

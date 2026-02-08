@@ -1,4 +1,5 @@
 from datetime import datetime, time, timezone
+from zoneinfo import ZoneInfo
 import re
 
 def parse_time(t: str) -> time:
@@ -71,15 +72,16 @@ def validate_booking(date_str: str, time_str: str, business_info: dict):
     except Exception:
         return False, "time", "That time doesn’t look valid. Please share a time like 3 PM or 15:30."
 
-    now_utc = datetime.now(timezone.utc)
-    today_utc = now_utc.date()
+    tz = ZoneInfo(business_info.get("timezone", "America/New_York"))
+    now_local = datetime.now(tz)
+    today_local = now_local.date()
 
     # Past date check
-    if booking_date < today_utc:
+    if booking_date < today_local:
         return False, "date", "That date is in the past. Please choose a future date."
 
     # Same-day cutoff check
-    if booking_date == today_utc and booking_time < same_day_cutoff:
+    if booking_date == today_local and booking_time < same_day_cutoff:
         return False, "time", f"Same-day bookings are available only after {same_day_cutoff.strftime('%H:%M')}."
 
     # Business hours check

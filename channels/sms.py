@@ -5,6 +5,7 @@ from twilio.twiml.messaging_response import MessagingResponse
 from database import SessionLocal
 from services.conversation_engine import handle_message
 from twilio.rest import Client
+from services.business_loader import build_business_info
 
 router = APIRouter()
 
@@ -20,9 +21,8 @@ async def sms_webhook(request: Request):
     print(f"[SMS_INCOMING] {phone}: {text}")
 
     db = SessionLocal()
-
-    from app import business_info, calendar_service, GOOGLE_CALENDAR_ID
-
+    from app import calendar_service, GOOGLE_CALENDAR_ID
+    business_info = build_business_info(db)
     response = handle_message(
         session_id=phone,
         user_text=text,

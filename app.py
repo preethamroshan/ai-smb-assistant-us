@@ -11,7 +11,7 @@ from database import engine
 from models import Base
 from database import SessionLocal
 from services.conversation_engine import handle_message, expire_payment_if_needed
-from models import Booking, Session, StripeWebhookEvent
+from models import Booking, Session, StripeWebhookEvent, Business
 import re
 
 from services.deposit_service import compute_deposit
@@ -28,7 +28,7 @@ from channels.sms import router as sms_router
 from apscheduler.schedulers.background import BackgroundScheduler
 from services.reminder_service import run_reminder_job
 from channels.whatsapp import send_whatsapp_message
-
+from services.business_loader import build_business_info
 load_dotenv()
 
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
@@ -49,10 +49,44 @@ def get_db():
     finally:
         db.close()
 
+def seed_default_business():
+    db = SessionLocal()
+    try:
+        if db.query(Business).first():
+            return
+
+        with open("business_config.json", "r") as f:
+            config = json.load(f)
+        
+        cutoff_raw = config.get("same_day_cutoff")
+
+        if cutoff_raw:
+            # Convert "17:00" → 17
+            cutoff_hour = int(str(cutoff_raw).split(":")[0])
+        else:
+            cutoff_hour = None
+
+        business = Business(
+            name=config["name"],
+            type=config["type"],
+            timezone=config["timezone"],
+            slot_duration_minutes=config["slot_duration_minutes"],
+            same_day_cutoff_hour=cutoff_hour,
+            business_hours=config["business_hours"],
+            services=config["services"],
+            deposit_required_after_hour=17,  # match current logic
+        )
+
+        db.add(business)
+        db.commit()
+    finally:
+        db.close()
+
+
 app = FastAPI()
 @app.on_event("startup")
 def on_startup():
-    Base.metadata.create_all(bind=engine)
+    seed_default_business()
 
 GOOGLE_SERVICE_ACCOUNT_PATH = os.getenv("GOOGLE_SERVICE_ACCOUNT_PATH")
 GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID")
@@ -60,14 +94,6 @@ GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID")
 calendar_service = None
 if GOOGLE_SERVICE_ACCOUNT_PATH and GOOGLE_CALENDAR_ID:
     calendar_service = get_calendar_service(GOOGLE_SERVICE_ACCOUNT_PATH)
-# Load business config
-with open("business_config.json", "r") as f:
-    business_info = json.load(f)
-
-# ----------------------------
-# Constants for Calendar
-# ----------------------------
-BUSINESS_TIMEZONE = os.getenv("BUSINESS_TIMEZONE", business_info["timezone"])
 
 # ----------------------------
 # Constants for WhatsApp
@@ -87,6 +113,7 @@ class Message(BaseModel):
 # =========================================================
 @app.post("/chat")
 def chat(msg: Message, db: Session = Depends(get_db)):
+    business_info = build_business_info(db)
     return handle_message(
         session_id=msg.session_id,
         user_text=msg.text,
@@ -164,6 +191,9 @@ def create_checkout_session(booking_id: str, db: Session = Depends(get_db)):
         booking.payment_status = "NOT_REQUIRED"
         booking.status = "CONFIRMED"
         booking.confirmed_at = datetime.now(timezone.utc)
+        
+        # 🔥 Default predictive risk
+        booking.no_show_risk = True
         db.commit()
         return {"status": "confirmed_without_payment"}
 
@@ -269,19 +299,25 @@ async def stripe_webhook(
         booking.status = "CONFIRMED"
         booking.confirmed_at = datetime.now(timezone.utc)
         booking.paid_at = datetime.now(timezone.utc)
+        # 🔥 Default predictive risk
+        booking.no_show_risk = True
         booking.stripe_payment_intent_id = session.payment_intent
 
         # Create calendar event ONLY HERE
         if calendar_service and GOOGLE_CALENDAR_ID:
             try:
+                business = db.query(Business).filter(
+                    Business.id == booking.business_id
+                ).first()
+
                 start_iso, end_iso = booking_to_event_times(
                     booking.date,
                     booking.time,
-                    business_info["slot_duration_minutes"],
-                    business_info["timezone"]
+                    business.slot_duration_minutes,
+                    business.timezone
                 )
 
-                event_title = f"{business_info['name']} - {booking.service}"
+                event_title = f"{business.name} - {booking.service}"
 
                 event_id = create_calendar_event(
                     service=calendar_service,
@@ -289,7 +325,7 @@ async def stripe_webhook(
                     title=event_title,
                     start_iso=start_iso,
                     end_iso=end_iso,
-                    timezone=business_info["timezone"]
+                    timezone=business.timezone
                 )
 
                 booking.calendar_event_id = event_id

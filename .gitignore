@@ -1,8 +1,32 @@
+# Virtual environment
 venv/
+
+# Environment variables
 .env
+
+# Python cache
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+
+# SQLite leftovers
 *.db
 *.sqlite3
+
+# Secrets folder
 secrets/
-*.json
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Alembic cache only
+alembic/__pycache__/

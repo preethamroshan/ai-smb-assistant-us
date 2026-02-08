@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 from random import choice
 import os
 from groq import Groq
-from models import Booking, Session
+from models import Booking, Session, Business
 from sqlalchemy.orm import Session as DBSession
 
 from prompts import build_system_prompt
@@ -21,7 +21,7 @@ from services.faq_service import (
 from utils.extraction_utils import safe_extract_date, safe_extract_time
 from utils.time_utils import format_time_for_user, user_mentioned_time
 from utils.date_utils import user_mentioned_date
-
+from utils.datetime_utils import booking_to_datetime
 from fsm.reschedule import handle_reschedule_state
 from fsm.cancel import handle_cancel_confirm_state
 from fsm.confirming import handle_confirming_state
@@ -337,11 +337,14 @@ def handle_message(
     # FETCH / CREATE SESSION
     # --------------------------------------------------
     session = db.query(Session).filter(Session.session_id == session_id).first()
+    business = db.query(Business).filter(Business.is_active == True).first()
+
     if not session:
         session = Session(
             session_id=session_id,
             booking_state="IDLE",
-            processed_message_ids=[]
+            processed_message_ids=[],
+            business_id=business.id
         )
         db.add(session)
         db.commit()
@@ -512,6 +515,24 @@ def handle_message(
             # YES → mark reminder confirmed
             # -------------------------------
             if intent == "booking_confirm" or text_lower in YES_WORDS:
+
+                # 🔥 Calculate appointment time
+                appointment_time = booking_to_datetime(db, booking)
+
+                # 🔥 Block late confirmations
+                if now > appointment_time:
+                    session.last_reminder_booking_id = None
+                    db.commit()
+
+                    return {
+                        "intent": "late_confirmation",
+                        "reply": "That appointment time has already passed. Would you like to book a new slot?"
+                    }
+                            
+                # 🔥 Only clear risk after 2h confirmation
+                if booking.reminder_2h_sent:
+                    booking.no_show_risk = False
+                # ✅ Valid confirmation
                 booking.reminder_confirmed = True
                 session.last_reminder_booking_id = None
                 session.updated_at = now
