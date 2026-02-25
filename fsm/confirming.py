@@ -3,7 +3,7 @@ from services.calendar_service import create_calendar_event
 from services.booking_service import booking_to_event_times
 from utils.extraction_utils import safe_extract_date, safe_extract_time
 from utils.time_utils import format_time_for_user
-
+from services.stripe_checkout import create_checkout_session_for_booking
 def handle_confirming_state(
     session,
     session_id,
@@ -72,29 +72,36 @@ def handle_confirming_state(
             )
 
             # --------------------------------------------------
-            # CASE 1: DEPOSIT REQUIRED → DO NOT CONFIRM
+            # CASE 1: DEPOSIT REQUIRED → CREATE PAYMENT LINK
             # --------------------------------------------------
             if deposit_amount > 0:
-
+                pending_booking.deposit_amount_cents = deposit_amount
                 pending_booking.payment_required = True
                 pending_booking.payment_status = "REQUIRES_PAYMENT"
-                pending_booking.deposit_amount_cents = deposit_amount
-                pending_booking.currency = "usd"
+
+                db.commit()
+                # Create Stripe Checkout Session
+                result = create_checkout_session_for_booking(pending_booking,db)
+
+                checkout_url = result["checkout_url"]
 
                 session.booking_state = "PAYMENT_PENDING"
                 session.updated_at = now
+
                 db.commit()
 
                 return {
                     "intent": "payment_required",
                     "reply": (
                         f"To confirm your {pending_booking.service} appointment on "
-                        f"{pending_booking.date} at {format_time_for_user(pending_booking.time)}, "
-                        "a small deposit is required.\n\n"
-                        "I’ll send you a secure payment link next."
+                        f"{pending_booking.date} at "
+                        f"{format_time_for_user(pending_booking.time)}, "
+                        "please complete the deposit using this secure link:\n\n"
+                        f"{checkout_url}\n\n"
+                        "This link expires in 15 minutes."
                     )
                 }
-
+            
             # --------------------------------------------------
             # CASE 2: NO DEPOSIT → CONFIRM IMMEDIATELY (OLD LOGIC)
             # --------------------------------------------------

@@ -10,7 +10,8 @@ from dotenv import load_dotenv
 from database import engine
 from models import Base
 from database import SessionLocal
-from services.conversation_engine import handle_message, expire_payment_if_needed
+from services.conversation_engine import handle_message
+from utils.payment_utils import expire_payment_if_needed
 from models import Booking, Session, StripeWebhookEvent, Business
 import re
 
@@ -29,6 +30,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from services.reminder_service import run_reminder_job
 from channels.whatsapp import send_whatsapp_message
 from services.business_loader import build_business_info
+from services.stripe_checkout import create_checkout_session_for_booking
 load_dotenv()
 
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
@@ -131,117 +133,14 @@ def chat(msg: Message, db: Session = Depends(get_db)):
 @app.post("/payments/create-checkout-session")
 def create_checkout_session(booking_id: str, db: Session = Depends(get_db)):
 
-    if not STRIPE_SECRET_KEY:
-        raise HTTPException(status_code=500, detail="Stripe not configured")
-
     booking = db.query(Booking).filter(Booking.id == booking_id).first()
     if not booking:
         raise HTTPException(status_code=404, detail="Booking not found")
     
-    now = datetime.now(timezone.utc)
-    # Auto-expire old payment attempts
-    if expire_payment_if_needed(booking, db, now):
-        raise HTTPException(
-            status_code=400,
-            detail="Payment session expired. Please start booking again."
-        )
-    
-    # Idempotency: already paid
-    if booking.payment_status == "PAID":
-        return {
-            "status": "already_paid",
-            "message": "Payment already completed"
-        }
-    
-    # ----------------------------------------
-    # VALIDATE BOOKING IS PAYABLE
-    # ----------------------------------------
-    if booking.status != "PENDING":
-        raise HTTPException(
-            status_code=400,
-            detail=f"Booking not payable (status={booking.status})"
-        )
-
-    if booking.payment_status not in {
-        None,
-        "REQUIRES_PAYMENT",
-        "CHECKOUT_CREATED"
-    }:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid payment state ({booking.payment_status})"
-        )
-
-    # Optional (but recommended): prevent expired payments
-    if booking.payment_expires_at and booking.payment_expires_at < datetime.now(timezone.utc):
-        raise HTTPException(
-            status_code=400,
-            detail="Payment session expired"
-        )
-
-    deposit_amount = compute_deposit(
-        booking.service,
-        booking.date,
-        booking.time
-    )
-
-    # No payment required
-    if deposit_amount <= 0:
-        booking.payment_required = False
-        booking.payment_status = "NOT_REQUIRED"
-        booking.status = "CONFIRMED"
-        booking.confirmed_at = datetime.now(timezone.utc)
-        
-        # 🔥 Default predictive risk
-        booking.no_show_risk = True
-        db.commit()
-        return {"status": "confirmed_without_payment"}
-
-    try:
-        checkout = stripe.checkout.Session.create(
-            mode="payment",
-            payment_method_types=["card"],
-            line_items=[{
-                "price_data": {
-                    "currency": "usd",
-                    "product_data": {
-                        "name": f"{booking.service} deposit",
-                    },
-                    "unit_amount": deposit_amount,
-                },
-                "quantity": 1,
-            }],
-            metadata={
-                "booking_id": booking.id,
-                "phone_number": booking.phone_number,
-            },
-            success_url=STRIPE_SUCCESS_URL,
-            cancel_url=STRIPE_CANCEL_URL,
-        )
-    except Exception as e:
-        booking.payment_last_error = str(e)
-        db.commit()
-        raise HTTPException(status_code=500, detail="Stripe checkout creation failed")
-
-    booking.payment_required = True
-    booking.payment_status = "CHECKOUT_CREATED"
-    booking.deposit_amount_cents = deposit_amount
-    booking.currency = "usd"
-
-    booking.stripe_checkout_session_id = checkout.id
-    booking.payment_link = checkout.url
-    booking.payment_expires_at = datetime.now(timezone.utc) + timedelta(minutes=15)
-    booking.payment_attempt_count = (booking.payment_attempt_count or 0) + 1
-
-    db.commit()
-
-    return {
-        "checkout_url": checkout.url,
-        "expires_at": booking.payment_expires_at.isoformat()
-    }
+    return create_checkout_session_for_booking(booking,db)
 
 # =========================================================
-# PAYMENTS — STRIPE WEBHOOK ENDPOINT
+# PAYMENTS — STRIPE WEBHOOK ENDPOINT (FINAL VERSION)
 # =========================================================
 @app.post("/stripe/webhook")
 async def stripe_webhook(
@@ -251,6 +150,9 @@ async def stripe_webhook(
 ):
     payload = await request.body()
 
+    # -----------------------------------------------------
+    # VERIFY SIGNATURE
+    # -----------------------------------------------------
     try:
         event = stripe.Webhook.construct_event(
             payload=payload,
@@ -261,80 +163,181 @@ async def stripe_webhook(
         print("❌ Stripe webhook verification failed:", str(e))
         return {"status": "invalid_signature"}
 
-    # Deduplicate webhook events
-    if db.query(StripeWebhookEvent).filter(
+    # -----------------------------------------------------
+    # IDEMPOTENCY — DEDUPE EVENTS
+    # -----------------------------------------------------
+    existing = db.query(StripeWebhookEvent).filter(
         StripeWebhookEvent.event_id == event.id
-    ).first():
+    ).first()
+
+    if existing:
         return {"status": "duplicate_event"}
 
-    db.add(StripeWebhookEvent(
-        event_id=event.id,
-        event_type=event.type,
-        payload=event.data.object
-    ))
+    db.add(
+        StripeWebhookEvent(
+            event_id=event.id,
+            event_type=event.type,
+            payload=event.data.object
+        )
+    )
     db.commit()
 
-    # ----------------------------------------
-    # PAYMENT SUCCESS
-    # ----------------------------------------
+    # -----------------------------------------------------
+    # HANDLE CHECKOUT COMPLETION
+    # -----------------------------------------------------
     if event.type == "checkout.session.completed":
-        session = event.data.object
-        booking_id = session.metadata.get("booking_id")
 
-        booking = db.query(Booking).filter(Booking.id == booking_id).first()
+        stripe_session = event.data.object
+
+        booking_id = stripe_session.metadata.get("booking_id")
+        phone_number = stripe_session.metadata.get("phone_number")
+
+        if not booking_id:
+            return {"status": "missing_booking_id"}
+
+        booking = db.query(Booking).filter(
+            Booking.id == booking_id
+        ).first()
+
         if not booking:
             return {"status": "booking_not_found"}
 
-        # Prevent double processing
+        # -------------------------------------------------
+        # PREVENT DOUBLE PROCESSING
+        # -------------------------------------------------
         if booking.payment_status == "PAID":
-            return {"status": "duplicate_event_ignored"}
+            return {"status": "already_processed"}
 
-        # Ignore late webhook for expired/cancelled booking
+        # -------------------------------------------------
+        # HANDLE LATE PAYMENT SAFELY
+        # -------------------------------------------------
         if booking.status != "PENDING":
+
             booking.payment_status = "LATE_PAYMENT"
+            booking.payment_last_error = "Payment received after booking expired"
             db.commit()
+
+            print(f"⚠️ Late payment ignored for booking {booking.id}")
+
             return {"status": "late_payment_ignored"}
 
+        now = datetime.now(timezone.utc)
+
+        # -------------------------------------------------
+        # CONFIRM BOOKING
+        # -------------------------------------------------
         booking.payment_status = "PAID"
         booking.status = "CONFIRMED"
-        booking.confirmed_at = datetime.now(timezone.utc)
-        booking.paid_at = datetime.now(timezone.utc)
-        # 🔥 Default predictive risk
+        booking.confirmed_at = now
+        booking.paid_at = now
         booking.no_show_risk = True
-        booking.stripe_payment_intent_id = session.payment_intent
 
-        # Create calendar event ONLY HERE
-        if calendar_service and GOOGLE_CALENDAR_ID:
-            try:
-                business = db.query(Business).filter(
-                    Business.id == booking.business_id
-                ).first()
+        booking.stripe_payment_intent_id = stripe_session.payment_intent
 
-                start_iso, end_iso = booking_to_event_times(
-                    booking.date,
-                    booking.time,
-                    business.slot_duration_minutes,
-                    business.timezone
-                )
+        print(f"✅ Booking {booking.id} marked CONFIRMED")
 
-                event_title = f"{business.name} - {booking.service}"
+        # -------------------------------------------------
+        # RESET FSM SESSION STATE
+        # -------------------------------------------------
+        session = db.query(Session).filter(
+            Session.session_id == booking.phone_number
+        ).first()
 
-                event_id = create_calendar_event(
-                    service=calendar_service,
-                    calendar_id=GOOGLE_CALENDAR_ID,
-                    title=event_title,
-                    start_iso=start_iso,
-                    end_iso=end_iso,
-                    timezone=business.timezone
-                )
+        if session:
 
-                booking.calendar_event_id = event_id
-            except Exception as e:
-                print("Calendar create failed after payment:", str(e))
+            session.booking_state = "IDLE"
+
+            session.pending_service = None
+            session.pending_date = None
+            session.pending_time = None
+            session.pending_booking_id = None
+
+            session.reschedule_target_booking_id = None
+            session.reschedule_new_date = None
+            session.reschedule_new_time = None
+
+            session.updated_at = now
+
+            print(f"✅ Session reset for {booking.phone_number}")
+
+        # -------------------------------------------------
+        # CREATE GOOGLE CALENDAR EVENT
+        # -------------------------------------------------
+        try:
+
+            business = db.query(Business).filter(
+                Business.id == booking.business_id
+            ).first()
+
+            start_iso, end_iso = booking_to_event_times(
+                booking.date,
+                booking.time,
+                business.slot_duration_minutes,
+                business.timezone
+            )
+
+            event_title = f"{business.name} - {booking.service}"
+
+            event_id = create_calendar_event(
+                service=calendar_service,
+                calendar_id=GOOGLE_CALENDAR_ID,
+                title=event_title,
+                start_iso=start_iso,
+                end_iso=end_iso,
+                timezone=business.timezone
+            )
+
+            booking.calendar_event_id = event_id
+
+            print(f"✅ Calendar event created {event_id}")
+
+        except Exception as e:
+
+            print("❌ Calendar create failed:", str(e))
 
         db.commit()
 
-    return {"status": "ok"}
+        # -------------------------------------------------
+        # SEND CONFIRMATION MESSAGE TO CUSTOMER
+        # -------------------------------------------------
+        try:
+            display_time = booking.time
+            try:
+                hour, minute = map(int, booking.time.split(":"))
+                suffix = "AM"
+                if hour >= 12:
+                    suffix = "PM"
+                display_hour = hour % 12
+                if display_hour == 0:
+                    display_hour = 12
+                display_time = f"{display_hour}:{minute:02d} {suffix}"
+            except:
+                pass
+            confirmation_message = (
+                f"✅ Your appointment is confirmed!\n\n"
+                f"Service: {booking.service}\n"
+                f"Date: {booking.date}\n"
+                f"Time: {display_time}\n"
+                f"Ref ID: {booking.id}\n\n"
+                f"Thank you!"
+            )
+            send_whatsapp_message(
+                phone=booking.phone_number,
+                text=confirmation_message
+            )
+
+            print(f"✅ Confirmation message sent to {booking.phone_number}")
+
+        except Exception as e:
+
+            print("❌ Failed to send confirmation message:", str(e))
+
+        return {"status": "payment_confirmed"}
+
+    # -----------------------------------------------------
+    # IGNORE OTHER EVENTS SAFELY
+    # -----------------------------------------------------
+    return {"status": "event_ignored"}
 
 # =========================================================
 # PAYMENTS — STATUS ENDPOINT
@@ -370,5 +373,5 @@ app.include_router(sms_router)
 @app.on_event("startup")
 def start_scheduler():
     scheduler = BackgroundScheduler()
-    scheduler.add_job(run_reminder_job, "interval", minutes=2)
+    scheduler.add_job(run_reminder_job, "interval", seconds=45)
     scheduler.start()
