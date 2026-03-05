@@ -4,6 +4,8 @@ from datetime import datetime, timezone
 from sqlalchemy import ForeignKey
 from sqlalchemy.dialects.postgresql import UUID
 import uuid
+from sqlalchemy import Text
+from sqlalchemy.dialects.postgresql import JSONB
 
 class Session(Base):
     __tablename__ = "sessions"
@@ -120,3 +122,72 @@ class StripeWebhookEvent(Base):
     event_type = Column(String, nullable=False)
     payload = Column(JSON, nullable=False)
     received_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+class ConversationMessage(Base):
+    __tablename__ = "conversation_messages"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+    business_id = Column(UUID(as_uuid=True), ForeignKey("businesses.id"), nullable=False, index=True)
+    session_id = Column(String, index=True)
+    phone_number = Column(String, index=True)
+
+    role = Column(String, nullable=False)  # user | bot | system
+    message_text = Column(Text, nullable=False)
+
+    normalized_intent = Column(String, nullable=True)
+    llm_confidence = Column(String, nullable=True)
+
+    llm_raw_json = Column(JSONB, nullable=True)
+
+    fsm_state_before = Column(String, nullable=True)
+    fsm_state_after = Column(String, nullable=True)
+
+    is_error = Column(Boolean, default=False)
+    error_type = Column(String, nullable=True)
+
+    latency_ms = Column(Integer, nullable=True)
+
+    model_version = Column(String, nullable=True)
+
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+class ConversationSession(Base):
+    __tablename__ = "conversation_sessions"
+
+    session_id = Column(String, primary_key=True)
+    business_id = Column(UUID(as_uuid=True), ForeignKey("businesses.id"), nullable=False, index=True)
+    phone_number = Column(String, index=True)
+
+    started_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    ended_at = Column(DateTime(timezone=True), nullable=True)
+
+    total_messages = Column(Integer, default=0)
+
+    booking_created = Column(Boolean, default=False)
+    booking_confirmed = Column(Boolean, default=False)
+    booking_cancelled = Column(Boolean, default=False)
+    booking_rescheduled = Column(Boolean, default=False)
+
+    payment_completed = Column(Boolean, default=False)
+    no_show = Column(Boolean, default=False)
+
+    fallback_count = Column(Integer, default=0)
+    handoff_count = Column(Integer, default=0)
+
+    avg_latency_ms = Column(Integer, nullable=True)
+
+class FSMTransition(Base):
+    __tablename__ = "fsm_transitions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+    business_id = Column(UUID(as_uuid=True), ForeignKey("businesses.id"), nullable=False, index=True)
+    session_id = Column(String, index=True)
+
+    from_state = Column(String, nullable=False)
+    to_state = Column(String, nullable=False)
+
+    trigger_intent = Column(String, nullable=True)
+
+    timestamp = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))

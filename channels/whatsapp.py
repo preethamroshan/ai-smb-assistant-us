@@ -59,47 +59,48 @@ async def whatsapp_webhook(request: Request):
     payload = await request.json()
 
     try:
-        entry = payload["entry"][0]
-        change = entry["changes"][0]
-        value = change["value"]
+        for entry in payload.get("entry", []):
+            for change in entry.get("changes", []):
+                value = change.get("value", {})
 
-        if "messages" not in value:
-            return {"status": "ignored_non_message"}
+                if "messages" not in value:
+                    continue
 
-        message = value["messages"][0]
+                for message in value["messages"]:
 
-        if message.get("type") != "text":
-            return {"status": "non_text_ignored"}
+                    if message.get("type") != "text":
+                        continue
 
-        phone = message["from"]
-        text = message["text"]["body"]
-        message_id = message["id"]
+                    phone = message["from"]
+                    text = message["text"]["body"]
+                    message_id = message["id"]
 
-        print(f"[WHATSAPP_INCOMING] {phone}: {text}")
+                    print(
+                        f"[WHATSAPP_INCOMING] "
+                        f"phone={phone} message_id={message_id} text={text}"
+                    )
 
-        db = SessionLocal()
+                    with SessionLocal() as db:
 
-        from app import calendar_service, GOOGLE_CALENDAR_ID
+                        from app import calendar_service, GOOGLE_CALENDAR_ID
 
-        business_info = build_business_info(db)
-        response = handle_message(
-            session_id=phone,
-            user_text=text,
-            message_id=message_id,
-            channel="whatsapp",
-            db=db,
-            business_info=business_info,
-            calendar_service=calendar_service,
-            GOOGLE_CALENDAR_ID=GOOGLE_CALENDAR_ID,
-        )
+                        business_info = build_business_info(db)
 
-        db.close()
+                        response = handle_message(
+                            session_id=phone,
+                            user_text=text,
+                            message_id=message_id,
+                            channel="whatsapp",
+                            db=db,
+                            business_info=business_info,
+                            calendar_service=calendar_service,
+                            GOOGLE_CALENDAR_ID=GOOGLE_CALENDAR_ID,
+                        )
 
-        reply_text = response.get("reply")
+                    reply_text = response.get("reply")
 
-        if reply_text:
-            send_whatsapp_message(phone, reply_text)
-
+                    if reply_text:
+                        send_whatsapp_message(phone, reply_text)
     except Exception as e:
         print("Webhook error:", e)
 

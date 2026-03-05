@@ -5,11 +5,12 @@ from models import Booking, Session
 from utils.time_utils import format_time_for_user
 from services.channel_router import send_message
 import os
+import logging
 from models import Business
 from utils.datetime_utils import booking_to_datetime
 
-FIRST_WINDOW = timedelta(minutes=3)
-SECOND_WINDOW = timedelta(minutes=1)
+FIRST_WINDOW = timedelta(hours=24)
+SECOND_WINDOW = timedelta(hours=2)
 
 def run_reminder_job():
 
@@ -19,7 +20,10 @@ def run_reminder_job():
     try:
         confirmed_bookings = (
             db.query(Booking)
-            .filter(Booking.status == "CONFIRMED")
+            .filter(
+                Booking.status == "CONFIRMED",
+                Booking.date >= now.date()
+            )
             .all()
         )
 
@@ -82,7 +86,8 @@ def run_reminder_job():
                 continue
 
     except Exception as e:
-        print("Reminder job error:", str(e))
+        logger = logging.getLogger(__name__)
+        logger.exception("Reminder job error")
 
     finally:
         db.close()

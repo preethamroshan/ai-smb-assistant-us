@@ -2,6 +2,8 @@ import json
 from datetime import datetime, timedelta, timezone
 from random import choice
 import os
+import time
+
 from groq import Groq
 from models import Booking, Session, Business
 from sqlalchemy.orm import Session as DBSession
@@ -12,10 +14,13 @@ from services.intent_normalizer import normalize_intent
 from services.booking_service import (
     extract_booking_ref_id,
 )
-
 from services.faq_service import (
     handle_faq_reply,
     infer_faq_intent_from_text,
+)
+from services.conversation_logger import (
+    log_conversation_message,
+    log_fsm_transition
 )
 
 from utils.extraction_utils import safe_extract_date, safe_extract_time
@@ -28,6 +33,7 @@ from fsm.cancel import handle_cancel_confirm_state
 from fsm.confirming import handle_confirming_state
 from fsm.collecting import handle_collecting_state
 import stripe
+
 from dotenv import load_dotenv
 load_dotenv()
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
@@ -272,6 +278,9 @@ def handle_message(
     calendar_service=None,
     GOOGLE_CALENDAR_ID=None,
 ):
+    start_time = time.time()
+    llm_raw = None
+    error_flag = False
     session_id = session_id
     user_text = user_text.strip()
     now = datetime.now(timezone.utc)
@@ -298,6 +307,7 @@ def handle_message(
     
     session.channel = channel
     db.commit()
+    fsm_state_before = session.booking_state
 
     # --------------------------------------------------
     # FSM TIMEOUT RESET
@@ -325,12 +335,19 @@ def handle_message(
             {"role": "system", "content": build_system_prompt(business_info)},
             {"role": "user", "content": user_text}
         ],
-        temperature=0.2
+        temperature=0
     )
+    # Support both real Groq response and mocked test dict
+    if isinstance(completion, dict):
+        raw_content = completion["choices"][0]["message"]["content"]
+    else:
+        raw_content = completion.choices[0].message.content
 
     try:
-        data = json.loads(completion.choices[0].message.content)
+        data = json.loads(raw_content)
+        llm_raw = data
     except Exception:
+        error_flag = True
         increment_failure(session, db, now)
 
         if should_handoff(session):
@@ -344,14 +361,38 @@ def handle_message(
 
         return {"intent": "fallback", "reply": "Sorry, I didn’t quite catch that. Could you rephrase?"}
 
+    confidence = data.get("confidence", 1)
+
+    # safeguard
+    if confidence < 0.6:
+
+        increment_failure(session, db, now)
+
+        if should_handoff(session):
+            offer_handoff(session, db, now)
+            reset_session(session, now)
+            db.commit()
+
+            return {
+                "intent": "handoff",
+                "reply": "Sorry — I’m having trouble understanding 😅 Would you like to speak to a human?"
+            }
+
+        return {
+            "intent": "fallback",
+            "reply": "Sorry, I didn’t quite catch that. Could you rephrase?"
+        }
+
 
     intent = data.get("intent")
+
     intent = normalize_intent(
         raw_intent=intent,
         user_text=user_text,
         session=session,
         db=db
     )
+    
     expiry_reply = handle_expired_session_ux(session, intent, user_text, db)
     if expiry_reply:
         return expiry_reply
@@ -769,7 +810,41 @@ def handle_message(
     if collecting_response:
         return collecting_response
 
-    return {
-    "intent": intent or "fallback",
-    "reply": data.get("reply") or f"Welcome to {business_info['name']}! How can I help you today?"
-}
+    response = {
+        "intent": intent or "fallback",
+        "reply": data.get("reply") or f"Welcome to {business_info['name']}! How can I help you today?"
+    }
+
+    # --------------------------------------------------
+    # LOGGING
+    # --------------------------------------------------
+
+    latency_ms = int((time.time() - start_time) * 1000)
+
+    fsm_state_after = session.booking_state
+
+    log_conversation_message(
+        db=db,
+        business_id=session.business_id,
+        session_id=session_id,
+        user_message=user_text,
+        bot_reply=response.get("reply"),
+        intent=response.get("intent"),
+        llm_raw=llm_raw,
+        latency_ms=latency_ms,
+        error=error_flag
+    )
+
+    if fsm_state_before != fsm_state_after:
+        log_fsm_transition(
+            db=db,
+            business_id=session.business_id,
+            session_id=session_id,
+            from_state=fsm_state_before,
+            to_state=fsm_state_after,
+            intent=response.get("intent")
+        )
+
+    db.commit()
+
+    return response

@@ -89,7 +89,7 @@ app = FastAPI()
 @app.on_event("startup")
 def on_startup():
     seed_default_business()
-
+print("REAL GROQ CALLED")
 GOOGLE_SERVICE_ACCOUNT_PATH = os.getenv("GOOGLE_SERVICE_ACCOUNT_PATH")
 GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID")
 
@@ -370,8 +370,9 @@ app.include_router(sms_router)
 # =========================================================
 # REMAINDER
 # =========================================================
+scheduler = BackgroundScheduler()
 @app.on_event("startup")
 def start_scheduler():
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(run_reminder_job, "interval", seconds=45)
-    scheduler.start()
+    if not scheduler.running:
+        scheduler.add_job(run_reminder_job, "interval", seconds=45)
+        scheduler.start()

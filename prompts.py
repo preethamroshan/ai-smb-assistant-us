@@ -21,6 +21,12 @@ Business context:
 
 You must classify the user's message into exactly ONE intent from this list:
 
+CRITICAL RULE:
+You MUST choose ONLY from the listed intents.
+DO NOT invent new intents.
+DO NOT output intent names not present in this list.
+If unsure, choose "fallback".
+
 BOOKING intents:
 1) booking_request
    - User wants to book a service or appointment.
@@ -59,6 +65,13 @@ BOOKING intents:
      "move it to tomorrow"
      "change my appointment to next Monday"
      "reschedule SALON-AB12CD34"
+     "push it to 5pm"
+     "bump it to tomorrow"
+     "can we shift it"
+     "let's move it later"
+     "earlier slot please"
+     "later time works better"
+     "can I do a different time"
 
 STATUS intent:
 6) booking_status
