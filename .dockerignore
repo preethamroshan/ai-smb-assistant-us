@@ -1,0 +1,28 @@
+# Git
+.git
+.gitignore
+
+# Python cache
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+venv
+.env
+.env.*
+
+# Local dev files
+*.log
+*.sqlite3
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Tests (optional)
+tests/
+
+# Node stuff (if ever added)
+node_modules

@@ -22,7 +22,7 @@ def run_reminder_job():
             db.query(Booking)
             .filter(
                 Booking.status == "CONFIRMED",
-                Booking.date >= now.date()
+                Booking.date >= now.date().isoformat()
             )
             .all()
         )
