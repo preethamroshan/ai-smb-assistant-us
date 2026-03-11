@@ -18,6 +18,7 @@ def handle_confirming_state(
     GOOGLE_CALENDAR_ID,
     user_wants_to_modify_booking,
     reset_failures,
+    conv_session
 ):
     if not pending_booking or session.booking_state != "CONFIRMING":
         return None
@@ -107,6 +108,7 @@ def handle_confirming_state(
             # --------------------------------------------------
             pending_booking.status = "CONFIRMED"
             pending_booking.confirmed_at = now
+            conv_session.booking_confirmed = True
             # 🔥 Default predictive risk
             pending_booking.no_show_risk = True
             # Google Calendar create (UNCHANGED)

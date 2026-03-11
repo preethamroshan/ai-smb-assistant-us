@@ -5,7 +5,7 @@ import os
 import time
 
 from groq import Groq
-from models import Booking, Session, Business
+from models import Booking, Session, Business, ConversationSession
 from sqlalchemy.orm import Session as DBSession
 
 from prompts import build_system_prompt
@@ -293,7 +293,23 @@ def handle_message(
     # --------------------------------------------------
     session = db.query(Session).filter(Session.session_id == session_id).first()
     business = db.query(Business).filter(Business.is_active == True).first()
+    # --------------------------------------------------
+    # FETCH / CREATE CONVERSATION SESSION
+    # --------------------------------------------------
+    conv_session = (
+        db.query(ConversationSession)
+        .filter(ConversationSession.session_id == session_id)
+        .first()
+    )
 
+    if not conv_session:
+        conv_session = ConversationSession(
+            session_id=session_id,
+            business_id=business.id,
+            phone_number=session_id
+        )
+        db.add(conv_session)
+        db.commit()
     if not session:
         session = Session(
             session_id=session_id,
@@ -308,6 +324,10 @@ def handle_message(
     session.channel = channel
     db.commit()
     fsm_state_before = session.booking_state
+
+    # Track total messages in session
+    conv_session.total_messages += 1
+    db.commit()
 
     # --------------------------------------------------
     # FSM TIMEOUT RESET
@@ -453,6 +473,8 @@ def handle_message(
 
     if intent == "fallback":
         increment_failure(session, db, now)
+        conv_session.fallback_count += 1
+        db.commit()
 
         if should_handoff(session):
             offer_handoff(session, db, now)
@@ -530,6 +552,7 @@ def handle_message(
     if intent == "talk_to_human":
         reset_session(session, now)
         reset_failures(session)
+        conv_session.handoff_count += 1
         db.commit()
         response = {
             "intent": "talk_to_human",
@@ -796,6 +819,7 @@ def handle_message(
         GOOGLE_CALENDAR_ID=GOOGLE_CALENDAR_ID,
         user_wants_to_modify_booking=user_wants_to_modify_booking,
         reset_failures=reset_failures,
+        conv_session=conv_session
     )
 
     if confirming_response:
