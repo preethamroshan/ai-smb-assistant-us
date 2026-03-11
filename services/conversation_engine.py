@@ -19,8 +19,7 @@ from services.faq_service import (
     infer_faq_intent_from_text,
 )
 from services.conversation_logger import (
-    log_conversation_message,
-    log_fsm_transition
+    finalize_response
 )
 
 from utils.extraction_utils import safe_extract_date, safe_extract_time
@@ -268,6 +267,7 @@ def reset_session(session: Session, now: datetime):
     session.failure_count = 0
     session.handoff_offered = False
 
+
 def handle_message(
     session_id: str,
     user_text: str,
@@ -287,7 +287,7 @@ def handle_message(
 
     if not session_id:
         return {"intent": "error", "reply": "Something went wrong. Please try again."}
-
+    
     # --------------------------------------------------
     # FETCH / CREATE SESSION
     # --------------------------------------------------
@@ -354,13 +354,34 @@ def handle_message(
             offer_handoff(session, db, now)
             reset_session(session, now)
             db.commit()
-            return {
+            response = {
                 "intent": "handoff",
-                "reply": "Sorry — I’m having trouble understanding 😅 Would you like to speak to a human? Please call +1-XXX-XXX-XXXX 📞"
+                "reply": "Sorry — I’m having trouble understanding. Would you like to speak to a human? Please call +1-XXX-XXX-XXXX 📞"
             }
+            return finalize_response(
+                db,
+                session,
+                session_id,
+                user_text,
+                response,
+                llm_raw,
+                start_time,
+                error_flag,
+                fsm_state_before
+            )
 
-        return {"intent": "fallback", "reply": "Sorry, I didn’t quite catch that. Could you rephrase?"}
-
+        response = {"intent": "fallback", "reply": "Sorry, I didn’t quite catch that. Could you rephrase?"}
+        return finalize_response(
+            db,
+            session,
+            session_id,
+            user_text,
+            response,
+            llm_raw,
+            start_time,
+            error_flag,
+            fsm_state_before
+        )
     confidence = data.get("confidence", 1)
 
     # safeguard
@@ -373,15 +394,37 @@ def handle_message(
             reset_session(session, now)
             db.commit()
 
-            return {
+            response = {
                 "intent": "handoff",
-                "reply": "Sorry — I’m having trouble understanding 😅 Would you like to speak to a human?"
+                "reply": "Sorry — I’m having trouble understanding. Would you like to speak to a human?"
             }
+            return finalize_response(
+                db,
+                session,
+                session_id,
+                user_text,
+                response,
+                llm_raw,
+                start_time,
+                error_flag,
+                fsm_state_before
+            )
 
-        return {
+        response = {
             "intent": "fallback",
             "reply": "Sorry, I didn’t quite catch that. Could you rephrase?"
         }
+        return finalize_response(
+            db,
+            session,
+            session_id,
+            user_text,
+            response,
+            llm_raw,
+            start_time,
+            error_flag,
+            fsm_state_before
+        )
 
 
     intent = data.get("intent")
@@ -395,7 +438,18 @@ def handle_message(
     
     expiry_reply = handle_expired_session_ux(session, intent, user_text, db)
     if expiry_reply:
-        return expiry_reply
+        response = expiry_reply
+        return finalize_response(
+            db,
+            session,
+            session_id,
+            user_text,
+            response,
+            llm_raw,
+            start_time,
+            error_flag,
+            fsm_state_before
+        )
 
     if intent == "fallback":
         increment_failure(session, db, now)
@@ -404,10 +458,21 @@ def handle_message(
             offer_handoff(session, db, now)
             reset_session(session, now)
             db.commit()
-            return {
+            response = {
                 "intent": "handoff",
-                "reply": "Sorry — I’m still not getting that 😅 Would you like to speak to a human? Please call +1-XXX-XXX-XXXX 📞"
+                "reply": "Sorry — I’m still not getting that. Would you like to speak to a human? Please call +1-XXX-XXX-XXXX"
             }
+            return finalize_response(
+                db,
+                session,
+                session_id,
+                user_text,
+                response,
+                llm_raw,
+                start_time,
+                error_flag,
+                fsm_state_before
+            )
 
     # --------------------------------------------------
     # FALLBACK FAQ ROUTING IF MODEL RETURNS "inquiry"
@@ -429,13 +494,35 @@ def handle_message(
         if session.booking_state in {"COLLECTING", "CONFIRMING"}:
             session.updated_at = now
             db.commit()
-            return {
+            response = {
                 "intent": intent,
                 "reply": f"{faq}\n\n{booking_continue_prompt(session)}"
             }
+            return finalize_response(
+                db,
+                session,
+                session_id,
+                user_text,
+                response,
+                llm_raw,
+                start_time,
+                error_flag,
+                fsm_state_before
+            )
 
         # If idle, just answer normally
-        return {"intent": intent, "reply": faq}
+        response = {"intent": intent, "reply": faq}
+        return finalize_response(
+                db,
+                session,
+                session_id,
+                user_text,
+                response,
+                llm_raw,
+                start_time,
+                error_flag,
+                fsm_state_before
+            )
 
     # --------------------------------------------------
     # HUMAN HANDOFF
@@ -444,10 +531,21 @@ def handle_message(
         reset_session(session, now)
         reset_failures(session)
         db.commit()
-        return {
+        response = {
             "intent": "talk_to_human",
-            "reply": "Sure — please call the salon at +1-XXX-XXX-XXXX 📞 (or reply with your name and we’ll have someone contact you)."
+            "reply": "Sure — please call the salon at +1-XXX-XXX-XXXX. (or reply with your name and we’ll have someone contact you)."
         }
+        return finalize_response(
+            db,
+            session,
+            session_id,
+            user_text,
+            response,
+            llm_raw,
+            start_time,
+            error_flag,
+            fsm_state_before
+        )
     # --------------------------------------------------
     # BOOKING STATUS
     # --------------------------------------------------
@@ -461,9 +559,20 @@ def handle_message(
         reset_failures(session)
         db.commit()
         if not latest:
-            return {"intent": "booking_status", "reply": "I don’t see any bookings yet. Would you like to make one?"}
+            response = {"intent": "booking_status", "reply": "I don’t see any bookings yet. Would you like to make one?"}
+            return finalize_response(
+                db,
+                session,
+                session_id,
+                user_text,
+                response,
+                llm_raw,
+                start_time,
+                error_flag,
+                fsm_state_before
+            )
 
-        return {
+        response = {
             "intent": "booking_status",
             "reply": (
                 f"Your latest booking:\n"
@@ -474,6 +583,18 @@ def handle_message(
                 f"Ref ID: {latest.id}"
             )
         }
+        return finalize_response(
+            db,
+            session,
+            session_id,
+            user_text,
+            response,
+            llm_raw,
+            start_time,
+            error_flag,
+            fsm_state_before
+        )
+    
     # --------------------------------------------------
     # REMINDER REPLY INTERCEPTOR (NON-FSM)
     # --------------------------------------------------
@@ -511,10 +632,21 @@ def handle_message(
                     session.last_reminder_booking_id = None
                     db.commit()
 
-                    return {
+                    response = {
                         "intent": "late_confirmation",
                         "reply": "That appointment time has already passed. Would you like to book a new slot?"
                     }
+                    return finalize_response(
+                        db,
+                        session,
+                        session_id,
+                        user_text,
+                        response,
+                        llm_raw,
+                        start_time,
+                        error_flag,
+                        fsm_state_before
+                    )
                             
                 # 🔥 Only clear risk after 2h confirmation
                 if booking.reminder_2h_sent:
@@ -526,10 +658,21 @@ def handle_message(
                 reset_failures(session)
                 db.commit()
 
-                return {
+                response = {
                     "intent": "reminder_confirmed",
                     "reply": "Perfect 👍 We’ll see you then!"
                 }
+                return finalize_response(
+                    db,
+                    session,
+                    session_id,
+                    user_text,
+                    response,
+                    llm_raw,
+                    start_time,
+                    error_flag,
+                    fsm_state_before
+                )
 
             # -------------------------------
             # CANCEL → move to cancel flow
@@ -545,7 +688,7 @@ def handle_message(
                 session.updated_at = now
                 db.commit()
 
-                return {
+                response = {
                     "intent": "cancel_confirmation",
                     "reply": (
                         f"Just to confirm — cancel your {booking.service} appointment on "
@@ -553,6 +696,17 @@ def handle_message(
                         "Reply YES to cancel or NO to keep it."
                     )
                 }
+                return finalize_response(
+                    db,
+                    session,
+                    session_id,
+                    user_text,
+                    response,
+                    llm_raw,
+                    start_time,
+                    error_flag,
+                    fsm_state_before
+                )
 
             # -------------------------------
             # Any other message → ignore reminder context
@@ -579,7 +733,18 @@ def handle_message(
     )
 
     if cancel_response:
-        return cancel_response
+        response = cancel_response
+        return finalize_response(
+            db,
+            session,
+            session_id,
+            user_text,
+            response,
+            llm_raw,
+            start_time,
+            error_flag,
+            fsm_state_before
+        )
 
     # --------------------------------------------------
     # CONFIRMING STATE (PENDING BOOKINGS)
@@ -598,13 +763,24 @@ def handle_message(
             session.updated_at = now
             db.commit()
 
-            return {
+            response = {
                 "intent": "payment_expired",
                 "reply": (
-                    "⏳ Your payment window expired, so the booking was released.\n"
+                    "Your payment window expired, so the booking was released.\n"
                     "Would you like to try booking again?"
                 )
             }
+            return finalize_response(
+                db,
+                session,
+                session_id,
+                user_text,
+                response,
+                llm_raw,
+                start_time,
+                error_flag,
+                fsm_state_before
+            )
         
     confirming_response = handle_confirming_state(
         session=session,
@@ -623,7 +799,18 @@ def handle_message(
     )
 
     if confirming_response:
-        return confirming_response
+        response = confirming_response
+        return finalize_response(
+            db,
+            session,
+            session_id,
+            user_text,
+            response,
+            llm_raw,
+            start_time,
+            error_flag,
+            fsm_state_before
+        )
 
     # --------------------------------------------------
     # CANCEL FLOW (INITIATE CANCELLATION) - supports Ref ID
@@ -650,10 +837,21 @@ def handle_message(
         booking_to_cancel = q.first()
 
         if not booking_to_cancel:
-            return {
+            response = {
                 "intent": "booking_cancel",
                 "reply": "I couldn’t find a confirmed appointment to cancel. If you have a reference ID, please share it."
             }
+            return finalize_response(
+                db,
+                session,
+                session_id,
+                user_text,
+                response,
+                llm_raw,
+                start_time,
+                error_flag,
+                fsm_state_before
+            )
 
         session.booking_state = "CANCEL_CONFIRM"
         session.pending_booking_id = booking_to_cancel.id
@@ -661,7 +859,7 @@ def handle_message(
         reset_failures(session)
         db.commit()
 
-        return {
+        response = {
             "intent": "cancel_confirmation",
             "reply": (
                 f"Just to confirm — cancel your {booking_to_cancel.service} appointment on "
@@ -669,6 +867,17 @@ def handle_message(
                 "Reply YES to cancel or NO to keep it."
             )
         }
+        return finalize_response(
+            db,
+            session,
+            session_id,
+            user_text,
+            response,
+            llm_raw,
+            start_time,
+            error_flag,
+            fsm_state_before
+        )
 
     # --------------------------------------------------
     # RESCHEDULE FLOW (INITIATE) - supports Ref ID
@@ -695,10 +904,21 @@ def handle_message(
         booking_to_reschedule = q.first()
 
         if not booking_to_reschedule:
-            return {
+            response = {
                 "intent": "booking_reschedule",
                 "reply": "I couldn’t find a confirmed appointment to reschedule. If you have a reference ID, please share it."
             }
+            return finalize_response(
+                db,
+                session,
+                session_id,
+                user_text,
+                response,
+                llm_raw,
+                start_time,
+                error_flag,
+                fsm_state_before
+            )
 
         session.booking_state = "RESCHEDULE_COLLECTING"
         session.reschedule_target_booking_id = booking_to_reschedule.id
@@ -734,7 +954,18 @@ def handle_message(
     )
 
     if reschedule_response:
-        return reschedule_response
+        response = reschedule_response
+        return finalize_response(
+            db,
+            session,
+            session_id,
+            user_text,
+            response,
+            llm_raw,
+            start_time,
+            error_flag,
+            fsm_state_before
+        )
 
     # --------------------------------------------------
     # IDLE STATE (SMART START)
@@ -780,10 +1011,21 @@ def handle_message(
         reset_failures(session)
         db.commit()
 
-        return {
+        response = {
             "intent": "booking_cancelled",
-            "reply": "Got it 👍 I’ve cancelled this booking request. Would you like to book something else?"
+            "reply": "Got it. I’ve cancelled this booking request. Would you like to book something else?"
         }
+        return finalize_response(
+            db,
+            session,
+            session_id,
+            user_text,
+            response,
+            llm_raw,
+            start_time,
+            error_flag,
+            fsm_state_before
+        )
 
     # --------------------------------------------------
     # COLLECTING STATE
@@ -808,43 +1050,31 @@ def handle_message(
     )
 
     if collecting_response:
-        return collecting_response
-
+        response = collecting_response
+        return finalize_response(
+            db,
+            session,
+            session_id,
+            user_text,
+            response,
+            llm_raw,
+            start_time,
+            error_flag,
+            fsm_state_before
+        )
+    
     response = {
         "intent": intent or "fallback",
         "reply": data.get("reply") or f"Welcome to {business_info['name']}! How can I help you today?"
     }
-
-    # --------------------------------------------------
-    # LOGGING
-    # --------------------------------------------------
-
-    latency_ms = int((time.time() - start_time) * 1000)
-
-    fsm_state_after = session.booking_state
-
-    log_conversation_message(
-        db=db,
-        business_id=session.business_id,
-        session_id=session_id,
-        user_message=user_text,
-        bot_reply=response.get("reply"),
-        intent=response.get("intent"),
-        llm_raw=llm_raw,
-        latency_ms=latency_ms,
-        error=error_flag
+    return finalize_response(
+        db,
+        session,
+        session_id,
+        user_text,
+        response,
+        llm_raw,
+        start_time,
+        error_flag,
+        fsm_state_before
     )
-
-    if fsm_state_before != fsm_state_after:
-        log_fsm_transition(
-            db=db,
-            business_id=session.business_id,
-            session_id=session_id,
-            from_state=fsm_state_before,
-            to_state=fsm_state_after,
-            intent=response.get("intent")
-        )
-
-    db.commit()
-
-    return response
