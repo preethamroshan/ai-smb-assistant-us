@@ -12,7 +12,10 @@ def log_conversation_message(
     bot_reply,
     intent,
     llm_raw,
-    latency_ms,
+    llm_confidence=None,
+    fsm_state_before=None,
+    fsm_state_after=None,
+    latency_ms=None,
     error=False
 ):
 
@@ -27,7 +30,10 @@ def log_conversation_message(
             role="user",
             message_text=user_message,
             normalized_intent=intent,
+            llm_confidence=llm_confidence,
             llm_raw_json=llm_raw,
+            fsm_state_before=fsm_state_before,
+            fsm_state_after=fsm_state_after,
             latency_ms=latency_ms,
             is_error=error,
             created_at=datetime.utcnow()
@@ -46,7 +52,10 @@ def log_conversation_message(
             role="bot",
             message_text=bot_reply,
             normalized_intent=intent,
+            llm_confidence=llm_confidence,
             llm_raw_json=llm_raw,
+            fsm_state_before=fsm_state_before,
+            fsm_state_after=fsm_state_after,
             latency_ms=latency_ms,
             is_error=error,
             created_at=datetime.utcnow()
