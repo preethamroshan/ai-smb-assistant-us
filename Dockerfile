@@ -6,12 +6,14 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y \
     build-essential \
     libpq-dev \
+    postgresql-client \
     && rm -rf /var/lib/apt/lists/*
 
+# install python dependencies first (better docker caching)
 COPY requirements.txt .
-
 RUN pip install --no-cache-dir -r requirements.txt
 
+# copy project files
 COPY . .
 
-CMD bash -c "alembic upgrade head && uvicorn app:app --host 0.0.0.0 --port 8000"
+EXPOSE 8000
