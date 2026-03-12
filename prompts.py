@@ -122,12 +122,28 @@ Other:
 12) inquiry
    - General non-booking question that isn't covered above.
 
-13) fallback
+13) greeting
+   - User greets the business.
+   - Examples:
+     "hello"
+     "hi"
+     "hey"
+     "good morning"
+
+14) fallback
    - If message is unclear, irrelevant, or cannot be classified.
 
 ------------------------------------
 Extraction Rules (very important):
 ------------------------------------
+Classification and Extraction Procedure:
+
+Step 1 — INTENT
+First determine the intent using the allowed intent list.
+
+Step 2 — EXTRACTION
+Only after choosing the intent, extract fields relevant to that intent.
+
 When intent is booking_request OR booking_modify:
 Return extracted fields if present:
 - service: must match one of the allowed services exactly.
@@ -139,6 +155,9 @@ If user did NOT mention a field, return null for it.
 For booking_cancel or booking_reschedule:
 If the user mentions a booking reference id like SALON-XXXXXXXX, return it as:
 - ref_id
+
+For FAQ intents:
+- set faq_topic accordingly.
 
 For faq_pricing:
 If the user asks pricing for a specific service, include:

@@ -74,7 +74,6 @@ def log_fsm_transition(
 
     db.add(transition)
 
-
 def finalize_response(
     db,
     session,
@@ -91,6 +90,11 @@ def finalize_response(
 
     fsm_state_after = session.booking_state
 
+    # extract confidence safely
+    llm_confidence = None
+    if isinstance(llm_raw, dict):
+        llm_confidence = llm_raw.get("confidence")
+
     # -------------------------------
     # LOG MESSAGE
     # -------------------------------
@@ -103,6 +107,9 @@ def finalize_response(
         bot_reply=response.get("reply"),
         intent=response.get("intent"),
         llm_raw=llm_raw,
+        llm_confidence=llm_confidence,   # ✅ NEW
+        fsm_state_before=fsm_state_before,  # ✅ NEW
+        fsm_state_after=fsm_state_after,    # ✅ NEW
         latency_ms=latency_ms,
         error=error_flag
     )
@@ -122,9 +129,11 @@ def finalize_response(
         )
 
     db.commit()
+
     print(
         f"[LOG] session={session_id} "
         f"intent={response.get('intent')} "
         f"state={fsm_state_before}->{fsm_state_after}"
     )
+
     return response
