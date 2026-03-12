@@ -2,6 +2,9 @@
 .git
 .gitignore
 
+# Docker
+.dockerignore
+
 # Python cache
 __pycache__
 *.pyc
@@ -21,8 +24,11 @@ venv
 .DS_Store
 Thumbs.db
 
-# Tests (optional)
+# Tests
 tests/
 
 # Node stuff (if ever added)
 node_modules
+
+# Database backups (server side)
+db_backups
